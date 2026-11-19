@@ -181,6 +181,9 @@ pub async fn accounts(host: &HostClient) -> Result<Vec<Account>, PluginFault> {
                 enabled: a["enabled"].as_bool().unwrap_or(false),
                 status: a["status"].as_str().unwrap_or("unknown").into(),
                 plan_type: a["planType"].as_str().map(|s| s.trim().to_lowercase()),
+                plan_type_display: a["planTypeDisplay"].as_str().map(str::to_string),
+                authentication_kind: a["authenticationKind"].as_str().map(str::to_string),
+                upstream_peer: a["upstream"]["discovered"].as_bool().unwrap_or(false),
                 groups: a["groups"]
                     .as_array()
                     .map(|g| {
@@ -423,6 +426,32 @@ pub async fn groups(host: &HostClient) -> Result<Vec<Group>, PluginFault> {
         }
     }
     Err(fault("分组数量超过200000"))
+}
+pub async fn account_scheduling_paused(
+    host: &HostClient,
+    account_id: &str,
+) -> Result<bool, PluginFault> {
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("accountId", account_id)
+        .finish();
+    let data = admin(
+        host,
+        "GET",
+        &format!("/api/admin/accounts/detail?{query}"),
+        None,
+    )
+    .await?;
+    let account = &data["account"];
+    if account["id"].as_str() != Some(account_id) {
+        return Err(fault("宿主返回了不同账户，检测已终止"));
+    }
+    let enabled = account["enabled"]
+        .as_bool()
+        .ok_or_else(|| fault("账户调度开关缺失，未发送检测请求"))?;
+    let status = account["status"]
+        .as_str()
+        .ok_or_else(|| fault("账户状态缺失，未发送检测请求"))?;
+    Ok(crate::domain::scheduling_paused(enabled, status))
 }
 pub async fn account_groups(
     host: &HostClient,

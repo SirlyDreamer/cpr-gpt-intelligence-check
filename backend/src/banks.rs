@@ -6,7 +6,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use gateway_plugin_sdk::{PluginFault, call::host::HttpRequest, client::HostClient};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 
@@ -77,19 +77,12 @@ pub async fn validate(
     commit: String,
 ) -> Result<Bank, PluginFault> {
     let digest = hash(data);
-    let path = engine.write_bank(&digest, data).await?;
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Info {
-        built_at: String,
-        models: Vec<Model>,
-    }
-    let info: Info = engine.call(json!({"op":"validate","path":path})).await?;
+    let parsed = engine.load_bank(&digest, data).await?;
     Ok(Bank {
         hash: digest,
         commit,
-        built_at: info.built_at,
-        models: info.models,
+        built_at: parsed.built_at.clone(),
+        models: parsed.models(),
         chunks: 0,
     })
 }

@@ -93,7 +93,6 @@ pub struct Manager {
     deadline: Option<tokio::time::Instant>,
     request_window: std::time::Duration,
     last_job_source: Option<String>,
-    score_bank: Option<(String, std::path::PathBuf)>,
     /// Host instance ID, used to ignore this plugin's own probe failures.
     pub instance_id: String,
 }
@@ -110,7 +109,6 @@ impl Manager {
             deadline: None,
             request_window: std::time::Duration::ZERO,
             last_job_source: None,
-            score_bank: None,
             instance_id: String::new(),
         }
     }
@@ -131,7 +129,7 @@ impl Manager {
             .iter()
             .enumerate()
             .filter(|(i, _)| index.is_none_or(|index| *i == index))
-            .map(|(_, (j, _))| (j.id.clone(), serde_json::to_value(j).unwrap()));
+            .map(|(_, (j, _))| (j.id.clone(), j.report()));
         self.progress.publish(
             self.summaries(),
             self.bank_status(),
@@ -286,27 +284,19 @@ impl Manager {
         json!({"active":self.active_bank(),"previous":self.control.previous_bank.as_ref().and_then(|h|self.control.banks.iter().find(|b|&b.hash==h)),"builtin":banks::builtin(),"update":self.control.update,"engineCommit":banks::engine_commit()})
     }
     pub fn summaries(&self) -> Vec<Value> {
-        self.jobs.iter().rev().map(|(j,_)|json!({"id":j.id,"accountId":j.account_id,"accountName":j.account_name,"source":j.source,"status":j.status,"verdict":j.verdict,"message":j.message,"createdAt":j.created_at,"finishedAt":j.finished_at,"roundCount":j.rounds.len(),"sampleCount":j.samples.len(),"consecutive":j.consecutive,"roundAttempts":j.round_attempts,"attemptLimit":j.config.failure_retries.saturating_add(1),"attemptCount":j.attempts.len(),"nextAt":j.next_at,"prediction":j.rounds.last().map(|r|&r.score.prediction),"probability":j.rounds.last().map(|r|r.score.probability),"bankHash":j.bank_hash,"disableState":j.disable_state,"groupState":j.group_state,"triggerCode":j.trigger.as_ref().map(|t|t.code)})).collect()
+        self.jobs.iter().rev().map(|(j,_)|json!({"id":j.id,"accountId":j.account_id,"accountName":j.account_name,"source":j.source,"status":j.status,"verdict":j.verdict,"message":j.message,"createdAt":j.created_at,"finishedAt":j.finished_at,"roundCount":j.rounds.len(),"sampleCount":j.samples.len(),"consecutive":j.consecutive,"roundAttempts":j.round_attempts,"attemptLimit":j.config.failure_retries.saturating_add(1),"attemptCount":j.attempts.len(),"nextAt":j.next_at,"prediction":j.rounds.last().map(|r|&r.score.prediction),"probability":j.rounds.last().map(|r|r.score.probability),"qualityScore":j.quality_score(),"requestModel":j.config.request_model,"targetModel":j.config.canonical(&j.config.request_model),"bankHash":j.bank_hash,"disableState":j.disable_state,"groupState":j.group_state,"triggerCode":j.trigger.as_ref().map(|t|t.code)})).collect()
     }
     async fn prepare_score(
         &mut self,
         host: &HostClient,
         i: usize,
-    ) -> Result<std::path::PathBuf, PluginFault> {
+    ) -> Result<std::sync::Arc<crate::engine::FingerprintBank>, PluginFault> {
         let bank = self.bank(self.jobs[i].0.bank_hash.as_ref().unwrap())?;
-        if let Some((hash, path)) = &self.score_bank
-            && hash == &bank.hash
-        {
-            return Ok(path.clone());
+        if let Some(cached) = self.engine.bank(&bank.hash) {
+            return Ok(cached);
         }
         let bytes = banks::read(host, &bank).await?;
-        let path = self.engine.write_bank(&bank.hash, &bytes).await?;
-        let _: Value = self
-            .engine
-            .call(json!({"op":"prepare_score","path":path}))
-            .await?;
-        self.score_bank = Some((bank.hash, path.clone()));
-        Ok(path)
+        self.engine.load_bank(&bank.hash, &bytes).await
     }
     pub async fn set_config(
         &mut self,
@@ -419,8 +409,14 @@ impl Manager {
                 .iter()
                 .find(|a| a.id == *id)
                 .ok_or_else(|| fault(format!("账户已不存在：{id}")))?;
-            if !a.supported || !a.enabled {
-                return Err(fault(format!("账户未启用或不支持检测：{}", a.name)));
+            if a.scheduling_paused() {
+                if source != "manual" {
+                    continue;
+                }
+                return Err(fault(format!("已暂停调度，未发送检测请求：{}", a.name)));
+            }
+            if !a.supported {
+                return Err(fault(format!("账户不支持检测：{}", a.name)));
             }
             if self
                 .jobs
@@ -933,8 +929,7 @@ impl Manager {
             let ids =
                 rows.iter()
                     .filter(|a| {
-                        a.enabled
-                            && a.supported
+                        a.can_detect()
                             && if s.scope == "ids" {
                                 s.account_ids.contains(&a.id)
                             } else {
@@ -1223,7 +1218,7 @@ impl Manager {
                         })
                     })
                 });
-            let Some(account) = account.filter(|a| a.enabled && a.supported) else {
+            let Some(account) = account.filter(|a| a.can_detect()) else {
                 continue;
             };
             // One check per account: skip while any detection runs, and for
@@ -1366,12 +1361,8 @@ impl Manager {
             .phase(&self.jobs[i].0.id, "scoring", json!({}));
         let deadline = self.deadline.unwrap() - std::time::Duration::from_millis(150);
         let scoring = async {
-            let path = self.prepare_score(host, i).await?;
-            self.engine
-                .call::<_, Score>(
-                    json!({"op":"score","path":path,"samples":self.jobs[i].0.samples}),
-                )
-                .await
+            let bank = self.prepare_score(host, i).await?;
+            Engine::score(bank, self.jobs[i].0.samples.clone()).await
         };
         let score = match tokio::time::timeout_at(deadline, scoring).await {
             Ok(result) => result?,
@@ -1469,6 +1460,17 @@ impl Manager {
             );
             return self.save_job(host, i).await.map(|()| None);
         }
+        // Read the host's current scheduling state before every attempt,
+        // including queued work, retries, and confirmation rounds.
+        if host::account_scheduling_paused(host, &self.jobs[i].0.account_id).await? {
+            self.jobs[i].0.finish(
+                "paused",
+                "inconclusive",
+                "已暂停调度，未发送新的检测请求",
+                now(),
+            );
+            return self.save_job(host, i).await.map(|()| None);
+        }
         if self.jobs[i].0.status == "queued" {
             let ident = self.check_identity(host, i).await?;
             let bank = self.active_bank();
@@ -1482,7 +1484,7 @@ impl Manager {
         if self.jobs[i].0.challenges.is_empty() {
             self.progress
                 .phase(&self.jobs[i].0.id, "preparing", json!({}));
-            self.jobs[i].0.challenges = self.engine.call(json!({"op":"challenges"})).await?;
+            self.jobs[i].0.challenges = crate::engine::challenges()?;
             self.prepare_score(host, i).await?;
             self.save_job(host, i).await?;
         }
@@ -1608,9 +1610,7 @@ impl Manager {
         self.progress
             .phase(&self.jobs[i].0.id, "validating", json!({}));
         let (numbers, error) = if let Some(text) = &outcome.text {
-            let validation = self.engine.call::<_, Vec<u32>>(
-                json!({"op":"sample","text":text,"expectedCount":outcome.expected_count}),
-            );
+            let validation = Engine::sample(text.clone(), outcome.expected_count);
             let deadline = self.deadline.unwrap() - std::time::Duration::from_millis(200);
             match tokio::time::timeout_at(deadline, validation).await {
                 Ok(Ok(numbers)) => (Some(numbers), None),
@@ -1697,7 +1697,7 @@ impl Manager {
 }
 
 /// One in-flight model probe. The task owns only network work: it never
-/// touches jobs, host state or the scoring worker, so several of them can run
+/// touches jobs, host state or the scoring engine, so several of them can run
 /// at the same time inside a single maintenance callback.
 struct ProbeTask {
     job: crate::domain::Job,

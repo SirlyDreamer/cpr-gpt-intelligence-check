@@ -6,12 +6,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import select
+import queue
+import shutil
 import struct
 import subprocess
 import sys
 import time
 import threading
+import tempfile
 import unittest
 from urllib.parse import parse_qsl, urlencode
 
@@ -32,26 +34,37 @@ def model_events(*values, end=False, wire_kind='json', parsed=True):
     return {'events':len(events),'end':end},b'HME1'+struct.pack('>I',len(events))+b''.join(struct.pack('>I',len(e)) for e in events)+b''.join(events)
 
 class Host:
-    def __init__(self, binary=BINARY, state=None, protocol_version=7):
+    def __init__(self, binary=BINARY, state=None, protocol_version=7, *, process_env=None):
         self.protocol_version=protocol_version
         self.send_lock=threading.Lock();self.timers=[]
         self.scheduling=[];self.pending_callbacks={};self.schedule_epochs={};self.suspended=set()
         self.state={} if state is None else state
-        self.enabled=True;self.streams={};self.executions=[];self.closes=0;self.fail_model=False;self.fail_download=False
+        self.enabled=True;self.account_status='normal';self.streams={};self.executions=[];self.closes=0;self.fail_model=False;self.fail_download=False
         self.identity="original";self.bank=(ROOT/"vendor/modeltrace/data/unified_bank.json").read_bytes();self.sha="b"*40
         self.disable_calls=0;self.fail_disable=False;self.sequence=1
         self.fail_put=None;self.model_read_delay=0;self.model_response_delay=0;self.callback_response_delay=0
         self.additional_accounts=[];self.error_logs=[];self.error_log_queries=[];self.fail_error_log=False
         self.groups=[{'id':'group-test','name':'测试组'},{'id':'group-degraded','name':'降智隔离组'}]
         self.memberships=['group-test'];self.move_calls=0;self.fail_move=False;self.ignore_move=False;self.updates=[]
-        env=os.environ.copy();env['MODELTRACE_DEV_PYTHON']=str(ROOT/'.venv/bin/python')
+        env=os.environ.copy()
+        if process_env:env.update(process_env)
         if RUNTIME_TMPDIR is not None:env['TMPDIR']=str(RUNTIME_TMPDIR)
         command=[str(binary)]
         if DENY_TIMESTAMPS:
             command=['strace','-f','-o',os.devnull,'-e','trace=utimensat','-e','inject=utimensat:error=EPERM',*command]
         self.process=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
-        contributes={name:{'id':'personal.modeltrace-health.'+name,'version':version,'stages':[name]} for name,version in [('management',2),('maintenance',1)]}
-        self.send({'type':'hello','handshake':{'protocol_version':protocol_version,'artifact_sha256':'a'*64,'plugin_id':'personal.modeltrace-health','instance_id':'test','generation':1,'incarnation':'test-run','contributes':contributes}}, {})
+        self.output_queue=queue.Queue();self.output_buffer=bytearray()
+        def read_output():
+            while True:
+                chunk=self.process.stdout.read1(65536)
+                self.output_queue.put(chunk)
+                if not chunk:break
+        self.reader=threading.Thread(target=read_output,daemon=True);self.reader.start()
+        manifest_path=Path(binary).resolve().parent.parent/'plugin.json'
+        manifest=json.loads((manifest_path if manifest_path.is_file() else ROOT/'plugin.json').read_text(encoding='utf-8'))
+        plugin_id=f"{manifest['publisher']}.{manifest['name']}"
+        contributes={name:{'id':plugin_id+'.'+name,'version':version,'stages':[name]} for name,version in [('management',2),('maintenance',1)]}
+        self.send({'type':'hello','handshake':{'protocol_version':protocol_version,'artifact_sha256':'a'*64,'plugin_id':plugin_id,'instance_id':'test','generation':1,'incarnation':'test-run','contributes':contributes}}, {})
         ready,_,_=self.receive();assert ready['type']=='ready',ready
         self.call_budgets=ready.get('call_budgets',{})
 
@@ -64,12 +77,12 @@ class Host:
 
     def receive(self):
         def read(n):
-            out=b''
-            while len(out)<n:
-                if not select.select([self.process.stdout],[],[],max(35,getattr(self,'receive_timeout',35)))[0]:raise AssertionError('Plugin RPC timed out')
-                chunk=os.read(self.process.stdout.fileno(),n-len(out))
+            while len(self.output_buffer)<n:
+                try:chunk=self.output_queue.get(timeout=max(35,getattr(self,'receive_timeout',35)))
+                except queue.Empty:raise AssertionError('Plugin RPC timed out') from None
                 if not chunk:raise AssertionError('Plugin stopped: '+self.process.stderr.read().decode()[:1000])
-                out+=chunk
+                self.output_buffer.extend(chunk)
+            out=bytes(self.output_buffer[:n]);del self.output_buffer[:n]
             return out
         while True:
             a,b=struct.unpack('>IQ',read(12));meta=json.loads(read(a));body=read(b);d=meta.get('data_bytes',0);r=meta.get('request_context_bytes',0)
@@ -203,9 +216,10 @@ class Host:
             elif uri.startswith('/api/admin/accounts/detail?'):
                 from urllib.parse import urlparse, parse_qs
                 account_id=parse_qs(urlparse(uri).query)['accountId'][0];assert account_id in ['acct-test',*[a['id'] for a in self.additional_accounts]]
-                data={'account':{'id':account_id,'groups':[{'id':i,'name':i} for i in self.memberships]}}
+                account=next((a for a in self.additional_accounts if a['id']==account_id),None)
+                data={'account':{'id':account_id,'enabled':account.get('enabled',True) if account else self.enabled,'status':account.get('status','normal') if account else self.account_status,'groups':[{'id':i,'name':i} for i in self.memberships]}}
             elif uri.startswith('/api/admin/accounts?'):
-                data={'items':[{'id':'acct-test','name':'test-account','email':'user@example.com','provider':'openai','enabled':self.enabled,'status':'normal','planType':'plus','groups':[{'id':i,'name':i} for i in self.memberships]}],'total':1}
+                data={'items':[{'id':'acct-test','name':'test-account','email':'user@example.com','provider':'openai','enabled':self.enabled,'status':self.account_status,'planType':'plus','groups':[{'id':i,'name':i} for i in self.memberships]}],'total':1}
                 data['items'].extend(self.additional_accounts);data['total']=len(data['items'])
             else:raise AssertionError(uri)
             return {'status':200,'version':'HTTP/1.1','headers':[],'body':{'kind':'handle','handle':self.stream(raw({'code':200,'data':data}))},'response':None,'session':False},b''
@@ -255,6 +269,7 @@ class Host:
             self.send({'type':'shutdown'})
             try:self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:self.process.kill();self.process.wait()
+        self.reader.join(timeout=5)
         self.process.stdin.close();self.process.stdout.close();self.process.stderr.close()
 
 class SimulatedFault(Exception):pass
@@ -266,7 +281,7 @@ class Integration(unittest.TestCase):
     def config(self,**overrides):
         b=self.host.request('api/bootstrap');c=b['config'];c.update({'keyId':'key-test','retryDelaySeconds':0});c.update(overrides)
         self.host.request('api/config',{'config':c,'revision':b['configRevision']});return c
-    def submit(self):return self.host.request('api/submit',{'accountIds':['acct-test'],'requestId':'submit-one'})['submitted'][0]
+    def submit(self,request='submit-one'):return self.host.request('api/submit',{'accountIds':['acct-test'],'requestId':request})['submitted'][0]
     def confirmed_config(self, **overrides):
         self.host.request('api/banks/builtin',{})
         cfg=dict(degradedModels=[m['id'] for m in json.loads(self.host.bank)['models']],lowConfidencePercent=0,degradedPercent=0)
@@ -283,6 +298,103 @@ class Integration(unittest.TestCase):
         for key in saved:
             if key not in ['autoMoveGroup','targetGroupId']:self.assertEqual(loaded[key],saved[key])
         self.assertFalse(loaded['autoMoveGroup']);self.assertEqual(loaded['targetGroupId'],'')
+
+    def test_paused_accounts_reject_manual_without_probe(self):
+        self.config()
+        for enabled,status in [(False,'normal'),(True,'disabled'),(True,'quota_paused')]:
+            with self.subTest(enabled=enabled,status=status):
+                self.host.enabled=enabled;self.host.account_status=status
+                self.host.request('api/submit',{'accountIds':['acct-test'],'requestId':f'paused-{enabled}-{status}'},ok=False)
+                self.assertEqual(self.host.executions,[])
+                self.assertEqual(self.host.request('api/jobs')['jobs'],[])
+
+    def test_account_paused_after_queue_skips_probe_and_can_resume(self):
+        self.config()
+        for enabled,status in [(False,'normal'),(True,'disabled'),(True,'quota_paused')]:
+            with self.subTest(enabled=enabled,status=status):
+                self.host.enabled=True;self.host.account_status='normal'
+                identity=self.submit(f'queued-{enabled}-{status}')
+                self.host.enabled=enabled;self.host.account_status=status
+                self.host.tick()
+                report=self.host.request('api/report?id='+identity)
+                self.assertEqual(report['status'],'paused')
+                self.assertIsNone(report['qualityScore'])
+                self.assertEqual(report['attempts'],[])
+                self.assertEqual(report['roundAttempts'],0)
+                self.assertEqual(self.host.executions,[])
+        self.host.enabled=True;self.host.account_status='normal'
+        identity=self.submit('resumed');self.host.tick(2)
+        self.assertEqual(self.host.request('api/report?id='+identity)['status'],'completed')
+        self.assertEqual(len(self.host.executions),1)
+
+    def test_account_paused_before_retry_sends_no_new_probe(self):
+        self.config(failureRetries=3,retryDelaySeconds=0)
+        self.host.fail_model=True
+        identity=self.submit();self.host.tick()
+        self.assertEqual(len(self.host.executions),1)
+        self.host.account_status='quota_paused';self.host.tick(2)
+        report=self.host.request('api/report?id='+identity)
+        self.assertEqual(report['status'],'paused')
+        self.assertEqual(len(self.host.executions),1)
+        self.assertEqual(self.host.disable_calls,0)
+
+    def test_account_paused_before_confirmation_sends_no_new_probe(self):
+        self.config(degradedModels=[m['id'] for m in json.loads(self.host.bank)['models']],lowConfidencePercent=0,degradedPercent=0,confirmationRounds=3)
+        identity=self.submit();self.host.tick()
+        self.assertEqual(len(self.host.executions),1)
+        self.host.enabled=False;self.host.tick(2)
+        report=self.host.request('api/report?id='+identity)
+        self.assertEqual(report['status'],'paused')
+        self.assertEqual(len(report['rounds']),1)
+        self.assertEqual(len(self.host.executions),1)
+        self.assertEqual(self.host.disable_calls,0)
+
+    def test_paused_accounts_skipped_by_schedule_and_error_trigger(self):
+        c=self.config(triggerErrorCodes=[503])
+        c['schedule'].update(enabled=True,scope='ids',accountIds=['acct-test'])
+        self.host.request('api/config',{'config':c,'revision':self.host.request('api/bootstrap')['configRevision']})
+        for enabled,status in [(False,'normal'),(True,'disabled'),(True,'quota_paused')]:
+            with self.subTest(enabled=enabled,status=status):
+                self.host.close();state=copy.deepcopy(self.host.state)
+                state[('control','main')]['value']['nextDue']=1
+                self.host=Host(state=state);self.addCleanup(self.host.close)
+                self.host.enabled=enabled;self.host.account_status=status
+                self.error_log(f'paused-{enabled}-{status}')
+                self.host.tick(2)
+                self.assertEqual(self.host.executions,[])
+                self.assertEqual(self.host.request('api/jobs')['jobs'],[])
+                self.assertIsNone(self.host.request('api/bootstrap')['scheduleError'])
+
+    def test_history_score_snapshot_and_restart(self):
+        target=json.loads(self.host.bank)['models'][0]['id']
+        self.config(lowConfidencePercent=0,degradedPercent=0,lowConfidenceRetries=0,confirmationRounds=1,aliases={'gpt-6.1-sol':target})
+        identity=self.submit()
+        self.assertIsNone(self.host.request('api/jobs')['jobs'][0]['qualityScore'])
+        self.host.tick(2)
+        report=self.host.request('api/report?id='+identity)
+        self.assertEqual(report['status'],'completed')
+        expected=100*next(r['probability'] for r in report['rounds'][-1]['score']['results'] if r['model']==target)
+        self.assertAlmostEqual(report['qualityScore'],expected)
+        self.assertEqual(report['targetModel'],target)
+        for endpoint in ['api/jobs','api/bootstrap','api/progress']:
+            summary=next(j for j in self.host.request(endpoint)['jobs'] if j['id']==identity)
+            self.assertAlmostEqual(summary['qualityScore'],expected)
+            self.assertEqual(summary['requestModel'],report['config']['requestModel'])
+            self.assertEqual(summary['targetModel'],target)
+        replacement=next(r['model'] for r in report['rounds'][-1]['score']['results'] if r['model']!=target)
+        self.config(degradedModels=[replacement],aliases={'gpt-6.1-sol':replacement})
+        self.assertAlmostEqual(self.host.request('api/jobs')['jobs'][0]['qualityScore'],expected)
+        self.host.close();state=copy.deepcopy(self.host.state)
+        self.assertNotIn('qualityScore',state[('jobs',identity)]['value'])
+        self.host=Host(state=state);self.addCleanup(self.host.close)
+        # The uncached report path and the progress cache must agree after reload.
+        self.assertAlmostEqual(self.host.request('api/report?id='+identity)['qualityScore'],expected)
+        self.assertAlmostEqual(self.host.request('api/progress')['jobs'][0]['qualityScore'],expected)
+        self.host.close();state=copy.deepcopy(self.host.state)
+        state[('jobs',identity)]['value']['status']='failed'
+        self.host=Host(state=state);self.addCleanup(self.host.close)
+        self.assertIsNone(self.host.request('api/report?id='+identity)['qualityScore'])
+        self.assertIsNone(self.host.request('api/jobs')['jobs'][0]['qualityScore'])
 
     def test_config_import_preview_validates_without_applying(self):
         before=self.host.request('api/bootstrap');old=copy.deepcopy(before['config'])
@@ -723,6 +835,26 @@ class Integration(unittest.TestCase):
         self.assertEqual(json.loads(payload)['error']['code'],'pagination_changed')
         self.assertEqual(len(self.host.request('api/jobs')['jobs']),1200)
 
+    def test_account_subscription_metadata(self):
+        self.host.additional_accounts=[
+            {'id':'plan-custom','name':'Custom','provider':'openai','enabled':True,'status':'normal',
+             'planType':' PROLITE ','planTypeDisplay':'ProLite','authenticationKind':'oauth','groups':[],
+             'upstream':{'discovered':True,'privateExtra':'must-not-be-forwarded'}},
+            {'id':'plan-api','name':'API','provider':'xai','enabled':True,'status':'normal',
+             'planType':None,'planTypeDisplay':'未知套餐','authenticationKind':'api_key','groups':[]},
+        ]
+        accounts={a['id']:a for a in self.host.request('api/accounts')['accounts']}
+        custom=accounts['plan-custom']
+        self.assertEqual(custom['planType'],'prolite')
+        self.assertEqual(custom['planTypeDisplay'],'ProLite')
+        self.assertEqual(custom['authenticationKind'],'oauth')
+        self.assertTrue(custom['upstreamPeer'])
+        self.assertNotIn('upstream',custom)
+        self.assertFalse(accounts['plan-api']['supported'])
+        self.assertEqual(accounts['plan-api']['authenticationKind'],'api_key')
+        self.assertFalse(accounts['acct-test']['upstreamPeer'])
+        self.assertIsNone(accounts['acct-test']['planTypeDisplay'])
+
     def test_large_account_page_stays_within_host_limit(self):
         self.host.additional_accounts=[{'id':f'large-account-{i:04d}','name':'长账户名称'*200,
             'provider':'openai','enabled':True,'status':'normal','planType':'plus','groups':[]}
@@ -730,6 +862,27 @@ class Integration(unittest.TestCase):
         accounts=self.host.request('api/accounts')['accounts']
         self.assertEqual(len(accounts),500)
         self.assertEqual(len({a['id'] for a in accounts}),500)
+
+    def test_standalone_binary_needs_no_python_or_writable_temp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            binary=root/('modeltrace-health.exe' if os.name=='nt' else 'modeltrace-health')
+            shutil.copy2(BINARY,binary)
+            missing=str(root/'missing-directory')
+            isolated=Host(binary=binary,process_env={'PATH':'','PYTHONHOME':missing,
+                'MODELTRACE_DEV_PYTHON':missing,'MODELTRACE_RUNTIME_DIR':missing,
+                'TMPDIR':missing,'TMP':missing,'TEMP':missing})
+            try:
+                b=isolated.request('api/bootstrap');config=b['config']
+                config.update(keyId='key-test',lowConfidencePercent=0,degradedPercent=100,retryDelaySeconds=0)
+                isolated.request('api/config',{'config':config,'revision':b['configRevision']})
+                job=isolated.request('api/submit',{'accountIds':['acct-test'],'requestId':'native-alone'})['submitted'][0]
+                isolated.tick(2)
+                report=isolated.request('api/report?id='+job)
+                self.assertEqual(report['status'],'completed',report['message'])
+                self.assertEqual(len(report['rounds']),1)
+                self.assertEqual(list(root.iterdir()),[binary])
+            finally:isolated.close()
 
     def test_binding_idempotency_and_completed_scoring(self):
         self.config(degradedModels=['gpt-5.6-luna'],lowConfidencePercent=0,degradedPercent=100)
@@ -1215,24 +1368,25 @@ class Integration(unittest.TestCase):
         report=self.host.request('api/report?id='+identity)
         self.assertNotEqual(report['status'],'interrupted');self.assertEqual(len(self.host.executions),2)
 
-    def test_invalid_samples_keep_healthy_worker(self):
+    def test_invalid_samples_need_no_child_process(self):
         self.config(lowConfidencePercent=0,degradedPercent=100)
         identity=self.submit();original=self.host.callback;workers=set()
         def callback(method,p,body):
-            workers.update(Path(f'/proc/{self.host.process.pid}/task/{self.host.process.pid}/children').read_text().split())
+            children=Path(f'/proc/{self.host.process.pid}/task/{self.host.process.pid}/children')
+            if children.exists():workers.update(children.read_text().split())
             if method=='host.model.stream_read':
                 return model_events({'type':'response.completed','response':{'output':[{'content':[{'type':'output_text','text':'1,2,3'}]}]}},end=True)
             return original(method,p,body)
         self.host.callback=callback;self.host.tick(3)
         report=self.host.request('api/report?id='+identity)
-        self.assertEqual(len(report['attempts']),3);self.assertEqual(len(workers),1)
+        self.assertEqual(len(report['attempts']),3);self.assertEqual(len(workers),0)
         self.assertTrue(all('有效数字' in a['error'] for a in report['attempts']))
 
     def test_restart_replays_receipt_and_saved_sample_without_model_request(self):
         for boundary in ('receipt','sample'):
             with self.subTest(boundary=boundary):
                 if boundary=='sample':
-                    # Warm the runtime like setUp: a cold release runtime defers the first probe by design.
+                    # Load the bank like setUp before testing the persistence boundary.
                     self.host.close();self.host=Host();self.addCleanup(self.host.close);self.host.request('api/banks/builtin',{})
                 self.config(lowConfidencePercent=0,degradedPercent=100)
                 identity=self.submit();original=self.host.callback;captured=[]
@@ -1464,7 +1618,7 @@ class Integration(unittest.TestCase):
         self.assertEqual(self.host.disable_calls,0);self.assertEqual(len(self.host.executions),1)
 
 if __name__=='__main__':
-    parser=argparse.ArgumentParser();parser.add_argument('--binary',type=Path,default=BINARY);parser.add_argument('--deny-timestamps',action='store_true',help='Use strace to deny utimensat and exercise restricted runtime extraction');parser.add_argument('--runtime-tmpdir',type=Path,help='Set TMPDIR for the plugin process to exercise runtime directory fallback');args,remaining=parser.parse_known_args();BINARY=args.binary;DENY_TIMESTAMPS=args.deny_timestamps;RUNTIME_TMPDIR=args.runtime_tmpdir
+    parser=argparse.ArgumentParser();parser.add_argument('--binary',type=Path,default=BINARY);parser.add_argument('--deny-timestamps',action='store_true',help='Use strace to deny utimensat; native scoring must not need it');parser.add_argument('--runtime-tmpdir',type=Path,help='Set TMPDIR to prove native scoring does not extract a runtime');args,remaining=parser.parse_known_args();BINARY=args.binary;DENY_TIMESTAMPS=args.deny_timestamps;RUNTIME_TMPDIR=args.runtime_tmpdir
     # Host defaults are evaluated at definition time.
     Host.__init__.__defaults__=(BINARY,None,7)
     unittest.main(argv=[sys.argv[0],*remaining])

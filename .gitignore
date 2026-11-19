@@ -5,7 +5,7 @@
 **/target/
 **/__pycache__/
 frontend/dist/
-runtime/*.tar.gz
+/debug.log
 dist/*
 !dist/.gitkeep
 *.pyc

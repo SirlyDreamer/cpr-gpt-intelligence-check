@@ -13,10 +13,8 @@ unshare "${task_namespace[@]}" \
     set -euo pipefail
     cd "$1"
     mount -t tmpfs -o size=64m,noexec,nodev,nosuid tmpfs "$3"
-    "$1/.venv/bin/python" scripts/protocol_smoke.py --binary "$2" --runtime-tmpdir "$3" --deny-timestamps -v
-    # This time allow execution: extraction must encounter ENOSPC, clean up,
-    # and fall back to another directory instead of failing the detection.
-    mount -o remount,exec "$3"
-    "$1/.venv/bin/python" scripts/protocol_smoke.py --binary "$2" --runtime-tmpdir "$3" Integration.test_binding_idempotency_and_completed_scoring -v
+    python3 scripts/protocol_smoke.py --binary "$2" --runtime-tmpdir "$3" --deny-timestamps Integration.test_binding_idempotency_and_completed_scoring -v
+    # Native inference must also work with a nonexistent temporary directory.
+    python3 scripts/protocol_smoke.py --binary "$2" Integration.test_standalone_binary_needs_no_python_or_writable_temp -v
     test -z "$(ls -A "$3")"
   ' -- "$task_root" "$task_binary" "$task_mount"

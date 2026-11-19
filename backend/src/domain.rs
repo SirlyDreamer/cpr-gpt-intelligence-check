@@ -299,6 +299,12 @@ pub struct Account {
     pub enabled: bool,
     pub status: String,
     pub plan_type: Option<String>,
+    #[serde(default)]
+    pub plan_type_display: Option<String>,
+    #[serde(default)]
+    pub authentication_kind: Option<String>,
+    #[serde(default)]
+    pub upstream_peer: bool,
     pub groups: Vec<Group>,
     pub supported: bool,
 }
@@ -308,6 +314,12 @@ pub struct Group {
     pub name: String,
 }
 impl Account {
+    pub fn scheduling_paused(&self) -> bool {
+        scheduling_paused(self.enabled, &self.status)
+    }
+    pub fn can_detect(&self) -> bool {
+        self.supported && !self.scheduling_paused()
+    }
     pub fn matches(&self, f: &Filter) -> bool {
         let plan = self.plan_type.as_deref().unwrap_or("unknown");
         let plan_matches = if !f.plans.is_empty() {
@@ -338,6 +350,11 @@ impl Account {
                 .to_lowercase()
                 .contains(&f.keyword.trim().to_lowercase()))
     }
+}
+// The host exposes manual suspension through enabled/status, and quota caps
+// through quota_paused. Exhausted quota and rate limits are distinct states.
+pub fn scheduling_paused(enabled: bool, status: &str) -> bool {
+    !enabled || matches!(status, "disabled" | "quota_paused")
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -474,6 +491,42 @@ fn no_action() -> String {
     "none".into()
 }
 impl Job {
+    /// Last completed round's probability for the requested target, resolved
+    /// through this job's saved aliases. Missing targets are not zero scores.
+    pub fn quality_score(&self) -> Option<f64> {
+        if self.status != "completed" {
+            return None;
+        }
+        let target = self.config.canonical(&self.config.request_model);
+        let probability = self
+            .rounds
+            .last()?
+            .score
+            .results
+            .iter()
+            .find(|candidate| candidate.model == target)?
+            .probability;
+        if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+            return None;
+        }
+        Some(probability * 100.0)
+    }
+    pub fn report(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).unwrap();
+        let fields = value.as_object_mut().unwrap();
+        for field in ["samples", "challenges", "pendingOutcome"] {
+            fields.remove(field);
+        }
+        fields.insert(
+            "qualityScore".into(),
+            serde_json::json!(self.quality_score()),
+        );
+        fields.insert(
+            "targetModel".into(),
+            serde_json::json!(self.config.canonical(&self.config.request_model)),
+        );
+        value
+    }
     pub fn can_disable(&self) -> bool {
         self.verdict == "degraded"
             || (self.status == "failed"
@@ -591,6 +644,83 @@ mod tests {
         }
     }
     #[test]
+    fn quality_score_uses_saved_target_alias_and_last_round_without_changing_verdict() {
+        let mut j = job();
+        j.status = "completed".into();
+        j.verdict = "inconclusive".into();
+        j.config.request_model = "target-alias".into();
+        j.config
+            .aliases
+            .insert("target-alias".into(), "large".into());
+        j.config.degraded_models = vec!["small-a".into()];
+        let candidates = [("large", 0.60), ("small-a", 0.25), ("small-b", 0.15)]
+            .into_iter()
+            .map(|(model, probability)| Candidate {
+                model: model.into(),
+                label: model.into(),
+                family: "test".into(),
+                probability,
+            })
+            .collect();
+        let mut result = score("large", 0.60);
+        result.results = candidates;
+        j.rounds.push(Round {
+            number: 1,
+            verdict: "inconclusive".into(),
+            score: result.clone(),
+            finished_at: 1,
+        });
+        assert_eq!(j.quality_score(), Some(60.0));
+        result.results[0].probability = 0.05;
+        result.results[1].probability = 0.80;
+        j.rounds.push(Round {
+            number: 2,
+            verdict: "inconclusive".into(),
+            score: result,
+            finished_at: 2,
+        });
+        assert_eq!(j.quality_score(), Some(5.0));
+        let report = j.report();
+        assert_eq!(report["verdict"], "inconclusive");
+        assert_eq!(report["qualityScore"], 5.0);
+        assert_eq!(report["targetModel"], "large");
+        for field in ["samples", "challenges", "pendingOutcome"] {
+            assert!(report.get(field).is_none());
+        }
+        // Derived data never changes the persisted schema; old jobs work too.
+        assert!(
+            serde_json::to_value(&j)
+                .unwrap()
+                .get("qualityScore")
+                .is_none()
+        );
+        j.config.degraded_models.clear();
+        assert_eq!(j.quality_score(), Some(5.0));
+        for status in ["queued", "running", "failed", "cancelled", "interrupted"] {
+            j.status = status.into();
+            assert_eq!(j.quality_score(), None);
+        }
+        j.status = "completed".into();
+        for (probability, expected) in [
+            (0.0, Some(0.0)),
+            (0.1, Some(10.0)),
+            (0.9, Some(90.0)),
+            (1.0, Some(100.0)),
+            (-0.1, None),
+            (1.1, None),
+            (f64::NAN, None),
+        ] {
+            j.rounds.last_mut().unwrap().score.results[0].probability = probability;
+            assert_eq!(j.quality_score(), expected);
+        }
+        j.config.request_model = "absent-target".into();
+        assert_eq!(j.quality_score(), None);
+        j.rounds.last_mut().unwrap().score.results.clear();
+        assert_eq!(j.quality_score(), None);
+        j.rounds.clear();
+        assert_eq!(j.quality_score(), None);
+    }
+    #[test]
     fn thresholds_and_confirmation() {
         let mut j = job();
         j.config.low_confidence_percent = 60.0;
@@ -694,6 +824,9 @@ mod tests {
             enabled: true,
             status: "normal".into(),
             plan_type: Some("pro".into()),
+            plan_type_display: Some("Pro".into()),
+            authentication_kind: Some("oauth".into()),
+            upstream_peer: false,
             groups: vec![],
             supported: true,
         };

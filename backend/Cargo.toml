@@ -1,22 +1,21 @@
 [package]
 name = "modeltrace-health"
-version = "1.25.0"
+version = "1.27.0"
 edition = "2024"
 rust-version = "1.99.1"
 license = "MIT"
 publish = false
 
 [dependencies]
-gateway-plugin-sdk = { git = "https://github.com/zyycn/codex-proxy-rs.git", rev = "4ee9abf9d2f5889b34202ade7597ff8cd5c2de22", features = ["io"] }
+gateway-plugin-sdk = { git = "https://github.com/zyycn/codex-proxy-rs.git", rev = "1173f6263da46fabab4715f774d00ceac38e15d3", features = ["io"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-tokio = { version = "1.52.3", features = ["io-std", "io-util", "macros", "rt", "sync", "time", "process"] }
+tokio = { version = "1.52.3", features = ["io-std", "io-util", "macros", "rt", "sync", "time"] }
 uuid = { version = "1.23.4", features = ["v4"] }
 url = "2.5.8"
 base64 = "0.22.1"
 flate2 = "1.1.9"
-tar = "0.4.46"
-tempfile = "3.27.0"
+getrandom = "0.4.3"
 sha2 = "0.10.9"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"

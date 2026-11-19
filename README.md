@@ -1,14 +1,16 @@
 # CPR 账号降智检测
 
-[![Release](https://img.shields.io/github/v/release/Victor-Tau/cpr-jzjc)](https://github.com/Victor-Tau/cpr-jzjc/releases/latest)
+[![Build](https://github.com/SirlyDreamer/cpr-gpt-intelligence-check/actions/workflows/build.yml/badge.svg)](https://github.com/SirlyDreamer/cpr-gpt-intelligence-check/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![CPR: 3.49.0](https://img.shields.io/badge/CPR-3.49.0-2563eb.svg)](https://github.com/zyycn/codex-proxy-rs)
+[![CPR: 3.52.1](https://img.shields.io/badge/CPR-3.52.1-2563eb.svg)](https://github.com/zyycn/codex-proxy-rs)
 
 在 **Codex Proxy RS（CPR）** 管理页面中，批量检测账户的模型输出、查看指纹匹配结果，并按自定义规则执行复测、定时检查和账户处理。
 
-项目基于 [ModelTrace](https://github.com/xqy2006/ModelTrace) 的数字指纹方法，比较账户实际回答与候选模型的匹配程度。检测、配置和报告均在插件页面完成，发布包内置 Python/NumPy 评分运行时。
+原项目 [Victor-Tau/cpr-jzjc](https://github.com/Victor-Tau/cpr-jzjc) 基于 [ModelTrace](https://github.com/xqy2006/ModelTrace) 的数字指纹方法，比较账户实际回答与候选模型的匹配程度。检测、配置和报告均在插件页面完成。
 
-**[下载插件](https://github.com/Victor-Tau/cpr-jzjc/releases/latest) · [使用指南](docs/usage.md) · [更新日志](CHANGELOG.md) · [开发与构建](docs/development.md) · [反馈问题](https://github.com/Victor-Tau/cpr-jzjc/issues)**
+本仓库基于 [Victor-Tau/cpr-jzjc](https://github.com/Victor-Tau/cpr-jzjc) 继续开发，将 ModelTrace 的逻辑改为 Rust 原生实现，不包含 Python/NumPy 环境。
+
+**[下载插件](https://github.com/SirlyDreamer/cpr-gpt-intelligence-check/releases) · [使用指南](docs/usage.md) · [更新日志](CHANGELOG.md) · [开发与构建](docs/development.md) · [反馈问题](https://github.com/SirlyDreamer/cpr-gpt-intelligence-check/issues)**
 
 ## 功能
 
@@ -21,6 +23,7 @@
 | 请求日志触发 | 配置 503 等错误码，从 CPR 运维错误日志匹配上游或客户端状态及诊断信息中的状态码，自动为对应账户排队检测；排除插件自身请求，按冷却时间限制重复触发 |
 | 历史保留 | 按账户保留最近 N 条检测记录（默认 10，可设 1–100） |
 | 检测报告 | 查看每轮候选模型概率、家族概率、请求记录、配置快照与指纹库版本 |
+| 质量历史 | 每账户最近 20 次检测色块，按目标模型概率显示 0–100 分；≥90 绿、10–<90 黄、<10 红，悬停查看详情，点击打开当次报告 |
 | 确认后处理 | 可分别开启关闭账户调度、移入指定分组；操作失败可单独重试 |
 | 指纹库更新 | 检查并应用上游指纹库，支持回退上一版本和恢复内置库 |
 | 配置备份 | 导出、校验和导入 JSON 配置；更新现有实例时保留配置及历史 |
@@ -42,19 +45,19 @@
 
 ### 环境要求
 
-| 项目 | 当前发布版本要求 |
+| 项目 | 当前源码版本要求 |
 | --- | --- |
-| 插件版本 | **1.25.0** |
-| CPR 宿主 | **>=3.49.0、<3.50.0** |
+| 插件版本 | **1.27.0（待发布）** |
+| CPR 宿主 | **>=3.52.1、<3.53.0** |
 | 平台 | **Linux x86_64 / ARM64（aarch64），glibc 2.36+** |
 | 运行模式 | `trustedProcess` |
-| 评分运行时 | 已包含私有 Python/NumPy，无需另装系统 Python 或部署 ModelTrace 服务 |
+| 评分引擎 | Rust 原生实现，内置指纹库；无需 Python、NumPy 或 ModelTrace 服务 |
 
-其他宿主版本请查看 [版本兼容表](CHANGELOG.md#宿主兼容性)，下载对应插件版本。
+当前源码已适配 CPR 3.52.1，发布前可按 [开发与构建](docs/development.md) 构建 1.27.0，或从成功的 [GitHub Actions 构建](https://github.com/SirlyDreamer/cpr-gpt-intelligence-check/actions/workflows/build.yml) 下载对应架构的 artifact。正式安装包以本仓库 Releases 实际附件为准；其他宿主版本请查看 [版本兼容表](CHANGELOG.md#宿主兼容性)，下载对应插件版本。
 
 ### 首次安装
 
-1. 从 [Releases](https://github.com/Victor-Tau/cpr-jzjc/releases/latest) 选择与宿主架构匹配的安装包：x86_64 对应 `*-x86_64-unknown-linux-gnu.tar.gz`，ARM64 对应 `*-aarch64-unknown-linux-gnu.tar.gz`，可同时下载 `.sha256` 校验文件。
+1. 从本仓库 [Releases](https://github.com/SirlyDreamer/cpr-gpt-intelligence-check/releases) 选择与宿主架构匹配的安装包：x86_64 对应 `*-x86_64-unknown-linux-gnu.tar.gz`，ARM64 对应 `*-aarch64-unknown-linux-gnu.tar.gz`，可同时下载 `.sha256` 校验文件。尚未发布的版本可使用上述 Actions 构建产物。
 2. 在 CPR 中打开「插件管理 → 安装插件 → 上传包」，上传下载的安装包并启用。
 3. 打开「账号降智检测 → 参数配置」，选择已有计量 Key，确认请求模型及判定规则，点击「保存全部参数」。
 4. 回到「账户检测」，先选择一个账户执行检测，在报告中查看结果，再按需启用批量检测或定时检查。
@@ -64,18 +67,6 @@
 两种架构使用同一个插件版本。历史 Release 若没有 ARM64 附件，可按 [开发与构建](docs/development.md) 从对应源码构建。PR 与主分支更新会自动验证两种架构；推送与插件版本一致的 `v<版本>` 标签后，发布流程会在两种架构均通过后上传安装包。
 
 检测请求由宿主绑定到账户 ID，沿用该账户的代理，并计入所选 Key 的用量。Key 的账户分组和模型权限由宿主校验，插件页面只读取 Key ID 和名称。
-
-首次检测会解出约 91 MB 的评分运行时，需要可写、可执行且空间充足的目录。容器临时目录受限时的配置见 [运行时排障](docs/usage.md#运行时无法启动)。
-
-### 更新现有实例
-
-在宿主插件管理中上传新版本包，更新并切换**现有插件实例**。同实例升级保留配置、计划、检测历史和指纹库；升级前也可在「参数配置 → 配置备份」导出配置。
-
-[1.25.0](https://github.com/Victor-Tau/cpr-jzjc/releases/tag/v1.25.0) 适配 CPR 3.49.0；[1.24.0](https://github.com/Victor-Tau/cpr-jzjc/releases/tag/v1.24.0) 适配 CPR 3.48.0；[1.23.0](https://github.com/Victor-Tau/cpr-jzjc/releases/tag/v1.23.0) 适配 CPR 3.47.0。同实例升级保留配置、计划、历史和指纹库，x86_64 与 ARM64 分别下载对应安装包。
-
-[1.21.0](https://github.com/Victor-Tau/cpr-jzjc/releases/tag/v1.21.0) 新增 Linux ARM64（aarch64）安装包，宿主范围与 1.20.0 相同（CPR 3.44.0）。同实例升级保留配置、计划、历史和指纹库；更新时选择与宿主架构一致的安装包。
-
-[1.14.0](https://github.com/Victor-Tau/cpr-jzjc/releases/tag/v1.14.0) 修复 CPR 3.38.1 下请求日志错误码未触发检测的问题，新增触发冷却，并改进账户页、报告和参数配置界面；宿主范围与 1.13.0 相同。详细变更见 [CHANGELOG](CHANGELOG.md)。
 
 ## 如何理解结果
 
@@ -101,7 +92,7 @@ ModelTrace 概率是当前候选库内、均匀先验下的相对概率。库外
 | [开发与构建](docs/development.md) | 源码结构、开发环境、单核构建、测试与管理接口 |
 | [验证记录](docs/verification.md) | 当前发行包的构建和回归结果、验证范围与复现命令 |
 
-欢迎通过 [Issues](https://github.com/Victor-Tau/cpr-jzjc/issues) 反馈问题或提出建议，也欢迎提交 Pull Request。问题报告请附上插件版本、CPR 版本、部署环境、复现步骤与预期/实际结果；检测相关问题可附脱敏后的错误信息、请求耗时与指纹库版本。请移除密钥、账户令牌、代理认证信息和个人数据。
+欢迎通过 [Issues](https://github.com/SirlyDreamer/cpr-gpt-intelligence-check/issues) 反馈问题或提出建议，也欢迎提交 Pull Request。问题报告请附上插件版本、CPR 版本、部署环境、复现步骤与预期/实际结果；检测相关问题可附脱敏后的错误信息、请求耗时与指纹库版本。请移除密钥、账户令牌、代理认证信息和个人数据。
 
 ## 开源许可与致谢
 

@@ -6,11 +6,11 @@
 
 | 路径 | 职责 |
 | --- | --- |
-| `backend/` | Rust 插件进程、宿主交互、检测调度与状态管理 |
+| `backend/` | Rust 插件进程、原生指纹评分、宿主交互、检测调度与状态管理 |
 | `frontend/` | Vue / TypeScript 插件管理页面 |
-| `engine/` | Python / NumPy 校验与评分 worker |
+| `engine/` | 仅供开发对照的 Python / NumPy 参考实现，不参与打包或运行 |
 | `vendor/modeltrace/` | 固定版本的 ModelTrace 源码、候选库与原始许可 |
-| `scripts/` | 运行时构建、打包、许可证收集及回归验证 |
+| `scripts/` | 打包、许可证收集、生成算法对照样本及回归验证 |
 | `plugin.json` | 插件身份、宿主兼容范围、资源及私有状态声明 |
 | `docs/releases/` | 各发行版本的详细说明 |
 
@@ -22,17 +22,13 @@
 | --- | --- |
 | Rust | `rust-toolchain.toml` 固定为 1.99.1，含 rustfmt 和 Clippy |
 | Node.js / pnpm | Node.js >=24、pnpm 9.12.2，使用前端锁文件安装依赖 |
-| Python | >=3.11.4，支持安全解压验证；CI 使用 3.11.17，开发依赖见 `requirements-dev.txt` |
+| Python | >=3.11.4，仅用于标准库打包辅助及测试脚本；构建不需要 venv 或 NumPy |
 | Zig / cargo-zigbuild | 构建 glibc 2.36 目标的发布二进制；也可在匹配架构、glibc <=2.36 的 Linux 环境启用原生构建 |
-| crane | 拉取构建脚本固定的 Python 运行时基础镜像；已有基础归档时可复用 |
 | cpr-plugin | `scripts/install_packager.py` 自动使用 `backend/Cargo.toml` 中 SDK 的固定提交安装 |
 
 ```bash
-git clone https://github.com/Victor-Tau/cpr-jzjc.git
-cd cpr-jzjc
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements-dev.txt
+git clone https://github.com/SirlyDreamer/cpr-gpt-intelligence-check.git
+cd cpr-gpt-intelligence-check
 pnpm --dir frontend install --frozen-lockfile
 ```
 
@@ -44,24 +40,25 @@ Rust 与前端依赖分别由 `backend/Cargo.lock` 和 `frontend/pnpm-lock.yaml`
 
 双架构实现的本地构建、架构防错与发布流程验证见 [ARM64 验证记录](verification-arm64.md)。
 
-每个任务调用同一个 `scripts/package.sh`，检查 Rust、前端、评分及构建脚本，验证最终包的所有 ELF 架构、资源摘要、私有 Python/NumPy 和冷启动评分，再执行最终包二进制的完整 RPC 回归。缓存键包含目标架构和依赖输入，两个任务使用各自工作区，不共享运行时和许可证输出。
+每个任务调用同一个 `scripts/package.sh`，检查 Rust、前端、评分及构建脚本，验证最终包的 ELF 架构、资源摘要、无 Python 资源和冷启动评分，再执行最终包二进制的完整 RPC 回归。缓存键包含目标架构和依赖输入。CI 容器内的 Python 仅用于标准库脚本，不会打入插件包；无需拉取额外运行时镜像、安装 Go/crane 或 NumPy wheel。
 
 日常功能修改无需增加 ARM64 专用操作。维护者一次性在仓库规则中将 `Build x86_64-unknown-linux-gnu` 和 `Build aarch64-unknown-linux-gnu` 设为必需检查。
 
-发布时同步 `plugin.json`、`backend/Cargo.toml` 和 `frontend/package.json` 中的同一个版本，推送 `v<版本>` 标签。工作流检查版本一致性，等待两个构建任务通过，核对两份安装包及摘要后上传 GitHub Release。安装包名称和 manifest 的 `package.target` 区分架构，插件版本不加架构后缀。
+发布时同步 `plugin.json`、`backend/Cargo.toml`、`backend/Cargo.lock` 和 `frontend/package.json` 中的同一个版本。API 或 SDK 合同有变更时递增中间的次版本号，并将末位归零（如 `1.26.1` → `1.27.0`）；无 API 变更的修复递增末位版本号。
 
-升级 CPR SDK 时，打包工具自动跟随 SDK 提交；验证脚本从源码 manifest 读取预期兼容范围。升级 Python/NumPy 或系统兼容基线时，需更新 `scripts/runtime_target.py` 中两种目标的固定输入及对应 wheel 摘要，CI 会验证各自的产物。
+推送 `v<版本>` 标签后，工作流检查版本一致性，等待两个构建任务通过，核对两份安装包及摘要后上传 GitHub Release。安装包名称和 manifest 的 `package.target` 区分架构，插件版本不加架构后缀。
+
+升级 CPR SDK 时，打包工具自动跟随 SDK 提交；验证脚本从源码 manifest 读取预期兼容范围。修改评分算法时，需要对照固定版本的 ModelTrace 重新验证概率与解析结果。平台架构校验见 `scripts/runtime_target.py`。
 
 ## 检查与测试
 
-在仓库根目录及已激活的 Python 虚拟环境中执行：
+在仓库根目录执行（Python 脚本只使用标准库）：
 
 ```bash
 cargo fmt --manifest-path backend/Cargo.toml --check
 cargo clippy --manifest-path backend/Cargo.toml --locked -- -D warnings
 cargo test --manifest-path backend/Cargo.toml --locked
 pnpm --dir frontend build
-python -m unittest discover -s engine/tests -v
 python -m unittest discover -s scripts/tests -v
 node scripts/api_smoke.mjs
 cargo build --manifest-path backend/Cargo.toml --locked
@@ -69,6 +66,18 @@ python scripts/protocol_smoke.py -v
 ```
 
 RPC 集成测试启动实际插件进程，模拟账户、计量 Key、宿主存储、模型事件和指纹库下载。覆盖请求绑定、复测、身份变化、定时范围、停用/移组重试、更新回退、取消、持久化恢复、并发与预算边界，不访问真实账户。可通过 `--binary /path/to/modeltrace-health` 验证从安装包解出的二进制。
+
+Rust 单元测试直接读取提交到仓库的 `backend/tests/fixtures/scoring.json`，与原 Python 实现逐项比对候选及家族概率；日常构建不需要安装 NumPy。仅在修改或重新生成参考样本时使用：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-dev.txt
+python scripts/scoring_reference.py
+python -m unittest discover -s engine/tests -v
+```
+
+数字解析使用固定 Unicode 15.0 的十进制数字与字母分类表，保留 Python 最长数字段规则。`--unicode-tables` 仅在维护分类表时使用，要求 Python 3.12。评分使用 `f64`；允许与 NumPy 运算顺序造成的微小舍入差异，回归误差上限为 `1e-10`。
 
 ## 单核发布构建
 
@@ -78,8 +87,6 @@ RPC 集成测试启动实际插件进程，模拟账户、计量 Key、宿主存
 export CARGO_BUILD_JOBS=1
 export RAYON_NUM_THREADS=1
 export UV_THREADPOOL_SIZE=1
-export OPENBLAS_NUM_THREADS=1
-export OMP_NUM_THREADS=1
 task_cpu=0
 ```
 
@@ -90,7 +97,7 @@ taskset -c "$task_cpu" python scripts/install_packager.py
 export PATH="$PWD/.cache/tools/bin:$PATH"
 ```
 
-安装所需工具并激活虚拟环境后，可使用完整打包脚本：
+安装所需工具后，可使用完整打包脚本：
 
 ```bash
 taskset -c "$task_cpu" bash scripts/package.sh
@@ -105,14 +112,13 @@ CPR_TARGET=aarch64-unknown-linux-gnu CPR_NATIVE_BUILD=1 \
 
 `CPR_NATIVE_BUILD=1` 要求宿主 Rust 目标与发布目标一致，且系统使用 glibc <=2.36。其他构建环境请安装 Zig / cargo-zigbuild，并在对应 Linux 架构运行最终包验证。
 
-该脚本安装前端依赖、构建页面、检查 Rust、运行单元测试、构建私有运行时、收集许可、生成发布二进制，并通过官方 CLI 打包、验证安装包。最终产物在 `dist/`，包括 `.tar.gz` 与对应 `.sha256`。完整 RPC 回归由 CI 对最终安装包执行；本地也可通过 `protocol_smoke.py --binary ...` 运行。浏览器及跨版本升级验证需另外运行。
+该脚本安装前端依赖、构建页面、检查 Rust、运行单元测试、收集许可、生成发布二进制，并通过官方 CLI 打包、验证安装包。发布包仅含插件二进制、前端静态文件与许可证，指纹库编入二进制；不打包 Python/NumPy。最终产物在 `dist/`，包括 `.tar.gz` 与对应 `.sha256`。完整 RPC 回归由 CI 对最终安装包执行；本地也可通过 `protocol_smoke.py --binary ...` 运行。浏览器及跨版本升级验证需另外运行。
 
 需要分别执行步骤时：
 
 ```bash
 taskset -c "$task_cpu" pnpm --dir frontend build
 task_target="${CPR_TARGET:-x86_64-unknown-linux-gnu}"
-python scripts/build_runtime.py --target "$task_target"
 python scripts/collect_licenses.py
 taskset -c "$task_cpu" cargo zigbuild --manifest-path backend/Cargo.toml \
   --locked --release --target "${task_target}.2.36"
@@ -121,21 +127,10 @@ cpr-plugin package --manifest plugin.json \
   --target "$task_target" --resource-map web=frontend/dist --output-dir dist
 task_version="$(python -c 'import json; print(json.load(open("plugin.json"))["version"])')"
 python scripts/verify_artifact.py \
-  "dist/personal.modeltrace-health-${task_version}-${task_target}.tar.gz" "$task_target"
+  "dist/sirly.modeltrace-health-${task_version}-${task_target}.tar.gz" "$task_target"
 ```
 
-运行时脚本验证固定基础镜像配置、镜像层、NumPy wheel 摘要及 ELF 架构，不依赖 Docker 守护进程。缓存位于 `.cache/runtime/<目标>/`。已有由 crane 拉取的基础归档时，可传入 `--base-tar /path/to/python-base.tar`。
-
-未修改 Python/NumPy 依赖时，可复用同一架构、已验证发布包中的运行时，并刷新评分与上游源码：
-
-```bash
-python scripts/refresh_runtime.py /path/to/previous-release.tar.gz \
-  --target aarch64-unknown-linux-gnu
-```
-
-目标也可由 `CPR_TARGET` 指定，默认 x86_64。必须同时提供原包的 `.sha256`；脚本校验包及全部资源，并在写入前检查 manifest 与运行时 ELF 架构。选错目标或校验失败时保留现有运行时。依赖变更时使用完整运行时构建。刷新后重新收集许可证，再编译、打包并运行最终包验证。
-
-`verify_artifact.py` 验证包和资源摘要、静态页面引用、私有 Python/NumPy 离线评分，并运行实际插件进程验证 Rust 解包和完整检测流程。跨版本保留验证使用：
+`verify_artifact.py` 验证包和资源摘要、静态页面引用、目标架构，并拒绝 Python 脚本、NumPy 和旧运行时资源；随后运行实际插件进程验证完整检测流程。跨版本保留验证使用：
 
 ```bash
 python scripts/upgrade_smoke.py /path/to/previous-release.tar.gz /path/to/current-release.tar.gz
@@ -169,17 +164,17 @@ python scripts/protocol_smoke.py --binary /path/to/package/bin/modeltrace-health
   --deny-timestamps Integration.test_binding_idempotency_and_completed_scoring -v
 ```
 
-Linux 上可加 `--runtime-tmpdir /dev/shm` 验证小容量、`noexec` 临时目录下的回退，运行前确认实际挂载选项。具备私有挂载命名空间权限时，也可运行：
+`Integration.test_standalone_binary_needs_no_python_or_writable_temp` 将二进制复制到空目录，清空 PATH 并指向不存在的临时目录，验证完整检测不依赖 Python 或解包资源。Linux 上可加 `--runtime-tmpdir /dev/shm` 验证 `noexec` 临时目录；具备私有挂载命名空间权限时，也可运行：
 
 ```bash
 bash scripts/restricted_runtime_smoke.sh /path/to/package/bin/modeltrace-health
 ```
 
-该脚本在独立命名空间创建 64 MB 临时挂载，验证 `noexec` 回退、时间戳系统调用被拒绝及空间耗尽后的清理与回退，不修改宿主挂载。
+该脚本在独立命名空间创建 64 MB 临时挂载，验证评分无需可执行临时目录或恢复时间戳，不修改宿主挂载。
 
 ## 管理接口
 
-插件 ID 为 `personal.modeltrace-health`，所有管理接口使用宿主管理员身份，路径相对插件实例命名空间。
+插件 ID 为 `sirly.modeltrace-health`，发布者 `sirly`、作者 `Sirly`。所有管理接口使用宿主管理员身份，路径相对插件实例命名空间。
 
 | 方法 | 相对路径 | 用途 |
 | --- | --- | --- |
@@ -195,6 +190,8 @@ bash scripts/restricted_runtime_smoke.sh /path/to/package/bin/modeltrace-health
 | POST | `api/banks/check` / `api/banks/apply` / `api/banks/rollback` / `api/banks/builtin` | 检查、应用、回退或恢复内置库 |
 
 1.14.0 起，`api/bootstrap`、`api/jobs` 与 `api/progress` 附带 `errorTrigger` 请求日志触发状态（最近读取、最近命中、累计触发次数与读取错误）。
+
+1.26.0 起，上述三个接口的任务摘要及 `api/report` 返回 `qualityScore: number | null` 和 `targetModel: string`；摘要另返回 `requestModel`。质量分数为最后一轮中、当次请求模型经当次别名映射后对应候选的概率 × 100，范围为 0–100。任务未完成、无轮次、目标候选缺失或概率无效时返回 `null`，0 是有效分数。字段从持久化报告派生，不写入私有状态，不需要迁移旧记录。前端分段为 `>=90` 绿色、`>=10 && <90` 黄色、`<10` 红色，与降智判定结论独立。
 
 1.10.0 起，大列表响应附带 `pagination: {field, nextOffset, snapshot}`，单页预算为 768 KiB。后续请求保留原查询参数，并附加 `pageOffset` 与 `pageSnapshot`；`nextOffset=null` 表示结束。快照变化返回 HTTP 409 和 `error.code=pagination_changed`，客户端应放弃部分数据并从头读取。`frontend/src/api.ts` 已实现完整合并和有限重读，写操作不会因分页自动重试。
 

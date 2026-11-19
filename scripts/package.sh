@@ -12,10 +12,8 @@ pnpm --dir frontend build
 cargo fmt --manifest-path backend/Cargo.toml --check
 cargo test --manifest-path backend/Cargo.toml --locked
 cargo clippy --manifest-path backend/Cargo.toml --locked --all-targets -- -D warnings
-python3 -m unittest discover -s engine/tests -v
 python3 -m unittest discover -s scripts/tests -v
 node scripts/api_smoke.mjs
-python3 scripts/build_runtime.py --target "$target" --cache-dir ".cache/runtime/$target" "$@"
 python3 scripts/collect_licenses.py
 if command -v cargo-zigbuild >/dev/null 2>&1; then
   cargo zigbuild --manifest-path backend/Cargo.toml --locked --release --target "${target}.2.36"
@@ -32,5 +30,5 @@ else
   exit 2
 fi
 cpr-plugin package --manifest plugin.json --binary "backend/target/$target/release/modeltrace-health" --target "$target" --resource-map web=frontend/dist --output-dir dist
-task_version="$(python3 -c 'import json; print(json.load(open("plugin.json"))["version"])')"
-python3 scripts/verify_artifact.py "dist/personal.modeltrace-health-${task_version}-${target}.tar.gz" "$target"
+task_package="$(python3 -c 'import json; m=json.load(open("plugin.json")); print(m["publisher"]+"."+m["name"]+"-"+m["version"])')"
+python3 scripts/verify_artifact.py "dist/${task_package}-${target}.tar.gz" "$target"

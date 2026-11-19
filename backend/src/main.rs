@@ -143,11 +143,7 @@ async fn handle(
                 .find(|(j, _)| j.id == id)
                 .ok_or_else(|| host::fault("报告不存在"))?
                 .0;
-            let mut value = serde_json::to_value(j).unwrap();
-            value.as_object_mut().unwrap().remove("samples");
-            value.as_object_mut().unwrap().remove("challenges");
-            value.as_object_mut().unwrap().remove("pendingOutcome");
-            Ok(value)
+            Ok(j.report())
         }
         ("POST", "api/config") => {
             let cfg = serde_json::from_value(body["config"].clone())
@@ -264,7 +260,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reload_signal = manager.reload_flag();
     let manager = Arc::new(Mutex::new(manager));
     let background = manager.clone();
-    let shutdown = manager.clone();
     let management_reload = reload_signal.clone();
     let plugin = PluginBuilder::from_json(include_bytes!("../../plugin.json"))?
         .management(registration(), move |call| {
@@ -362,13 +357,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })?
         .build()?;
-    let result = session.run(plugin).await;
-    shutdown
-        .lock()
-        .await
-        .engine
-        .cleanup()
-        .map_err(|e| std::io::Error::other(e.message))?;
-    result?;
+    session.run(plugin).await?;
     Ok(())
 }

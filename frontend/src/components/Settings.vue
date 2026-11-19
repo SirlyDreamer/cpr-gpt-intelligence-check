@@ -10,12 +10,14 @@ import {
   Info, RefreshCw, RotateCcw, Save, ShieldAlert, SlidersHorizontal, TriangleAlert, Undo2, Upload, UserX,
 } from '@lucide/vue'
 import { api, date, statusLabels } from '../api'
+import { isGptAccount, planOptions as subscriptionOptions } from '../subscription'
 import type { Account, Banks, Config, ErrorTrigger, Group } from '../types'
 
 const props = defineProps<{ config: Config; revision: number; banks: Banks; keys: { id: string; name: string }[]; accounts: Account[]; groups: Group[]; selected: string[]; nextDue: number | null; scheduleError: string | null; busy: boolean; errorTrigger?: ErrorTrigger }>()
 const emit = defineEmits<{ save: [config: Config]; bank: [operation: 'check' | 'apply' | 'rollback' | 'builtin']; error: [message: string] }>()
 
 const uid = useId()
+const pluginId = 'sirly.modeltrace-health'
 const id = (name: string) => `${uid}-${name}`
 
 function normalizeScheduleFilter(config: Config) {
@@ -101,7 +103,7 @@ const modelOptions = computed(() => models.value.map(m => ({ value: m, label: m 
 const effortOptions = ['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh'].map(s => ({ value: s, label: s || '不传递' }))
 const targetOptions = computed(() => props.groups.map(g => ({ value: g.id, label: g.name })))
 const groupOptions = computed(() => [{ value: '', label: '全部分组' }, { value: '__ungrouped__', label: '未分组' }, ...props.groups.map(g => ({ value: g.id, label: g.name }))])
-const planOptions = computed(() => Array.from(new Set(props.accounts.map(a => a.planType || 'unknown'))).sort().map(p => ({ value: p, label: p })))
+const planOptions = computed(() => subscriptionOptions(props.accounts.filter(isGptAccount), cfg.value.schedule.filter.plans))
 const statusOptions = [{ value: '', label: '全部已启用状态' }, ...Object.entries(statusLabels).map(([value, label]) => ({ value, label }))]
 const kindOptions = [{ value: 'interval', label: '固定间隔' }, { value: 'daily', label: '每日时刻' }]
 const scopeOptions = [{ value: 'filter', label: '动态匹配筛选条件' }, { value: 'ids', label: '固定账户列表' }]
@@ -150,7 +152,7 @@ function useDefaults() {
   rulesNotice.value = '已填入默认规则（失败重试 4 次、请求拒绝后保留调度，并清空日志触发错误码、冷却恢复 30 分钟），保存后生效。'
 }
 function exportConfig() {
-  const data = { format: 'modeltrace-health-config', version: 1, pluginId: 'personal.modeltrace-health', config: props.config }
+  const data = { format: 'modeltrace-health-config', version: 1, pluginId, config: props.config }
   exportedJson.value = JSON.stringify(data, null, 2) + '\n'
   // RS embeds this page with sandbox="allow-scripts", which blocks downloads.
   // Always expose the JSON so backup also works inside that isolated frame.
@@ -180,7 +182,7 @@ async function importConfig(event: Event) {
     const data = JSON.parse(await file.text())
     if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('配置文件须为JSON对象')
     const wrapped = Object.hasOwn(data, 'format')
-    if (wrapped && (data.format !== 'modeltrace-health-config' || data.version !== 1 || data.pluginId !== 'personal.modeltrace-health')) throw new Error('配置文件类型或版本不受支持')
+    if (wrapped && (data.format !== 'modeltrace-health-config' || data.version !== 1 || ![pluginId, 'personal.modeltrace-health'].includes(data.pluginId))) throw new Error('配置文件类型或版本不受支持')
     const result = await api.previewConfig(wrapped ? data.config : data)
     cfg.value = result.config
     normalizeScheduleFilter(cfg.value)

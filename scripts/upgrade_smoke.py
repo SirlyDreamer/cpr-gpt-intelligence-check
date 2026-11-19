@@ -37,6 +37,7 @@ def main():
             with tarfile.open(package) as archive:
                 archive.extractall(root, filter="data")
         manifests = [json.loads((root / "plugin.json").read_text()) for root in roots]
+        assert (manifests[0]['publisher'],manifests[0]['name']) == (manifests[1]['publisher'],manifests[1]['name']), 'Different plugin IDs require a new installation and config import; shared-state upgrade is not supported'
         assert manifests[0]["state"] == manifests[1]["state"]
         old = Host(binary=roots[0] / "bin/modeltrace-health", protocol_version=manifests[0]["package"]["protocolVersion"])
         try:

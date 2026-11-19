@@ -1,6 +1,21 @@
 // Node 24 直接运行 TypeScript，验证页面实际使用的请求和分页合并逻辑。
 import assert from 'node:assert/strict'
-import { request } from '../frontend/src/api.ts'
+import { request, schedulingPaused } from '../frontend/src/api.ts'
+import { groupHistory, historyTone, scoreText, scoreValue } from '../frontend/src/score-history.ts'
+import { isGptAccount, planOptions, subscriptionLabel } from '../frontend/src/subscription.ts'
+
+const subscriptions = [
+  {provider:'openai',planType:'prolite',planTypeDisplay:'ProLite'},
+  {provider:'xai',planType:'supergrok',planTypeDisplay:'SuperGrok'},
+]
+assert.deepEqual(planOptions(subscriptions.filter(isGptAccount), ['legacy_plan']), [
+  {value:'legacy_plan',label:'legacy_plan'}, {value:'prolite',label:'ProLite'},
+])
+assert.equal(subscriptionLabel({planType:'pro',planTypeDisplay:'Host Custom Plan'}),'Host Custom Plan')
+assert.equal(subscriptionLabel({planType:'pro',authenticationKind:'api_key'}),'API')
+assert.equal(subscriptionLabel({planType:'pro',authenticationKind:'api_key',upstreamPeer:true}),'CPR')
+for (const [planType,label] of [['team','Business'],['business','Enterprise'],['self_serve_business_prolite','Business Premium'],['self_serve_business_usage_based','Business'],['enterprise_cbp_usage_based','Enterprise'],['sci','Academic Researchers'],['sci_plus','Academic Researchers Plus']]) assert.equal(subscriptionLabel({planType}),label)
+for (const [enabled,status,paused] of [[false,'normal',true],[true,'disabled',true],[true,'quota_paused',true],[true,'quota_exhausted',false],[true,'rate_limited',false],[true,'normal',false]]) assert.equal(schedulingPaused({enabled,status}),paused)
 
 const calls = []
 const response = (value, status = 200) => ({ status, body: new TextEncoder().encode(JSON.stringify(value)).buffer })
@@ -48,3 +63,28 @@ await assert.rejects(request('POST', 'api/config', { revision: 1 }), /配置冲�
 assert.equal(calls.length, 1)
 assert.deepEqual(JSON.parse(calls[0].body), { revision: 1 })
 console.log('API pagination: all fields, Unicode, query retention, snapshot restart, retry bound, invalid cursor and POST errors passed.')
+
+const point = { id:'a', accountId:'one', createdAt:100, status:'completed', verdict:'no_match', qualityScore:0 }
+assert.equal(scoreText(point), '0.0 分')
+assert.equal(historyTone(point), 'low')
+assert.equal(scoreText({...point, qualityScore:100}), '100.0 分')
+assert.equal(scoreText({...point, qualityScore:89.99}), '<90 分')
+assert.equal(scoreText({...point, qualityScore:9.99}), '<10 分')
+for (const value of [undefined, null, NaN, Infinity, -1, 101]) {
+  assert.equal(scoreValue({...point, qualityScore:value}), null)
+  assert.equal(historyTone({...point, qualityScore:value}), 'unknown')
+}
+for (const status of ['failed','cancelled','interrupted','queued','running']) {
+  assert.equal(scoreText({...point,status}), '无分数')
+  assert.notEqual(historyTone({...point,status}), 'high')
+}
+for (const [qualityScore,tone] of [[0,'low'],[9.99,'low'],[10,'medium'],[89.99,'medium'],[90,'high'],[100,'high']]) {
+  for (const verdict of ['degraded','no_match','inconclusive']) assert.equal(historyTone({...point,qualityScore,verdict}),tone)
+}
+const records = [{...point,id:'c',createdAt:300}, {...point,id:'b',createdAt:100}, point, {...point,id:'other',accountId:'two'}]
+const groups = groupHistory(records)
+assert.deepEqual(groups.get('one').map(j=>j.id), ['a','b','c'])
+assert.deepEqual(groups.get('two').map(j=>j.id), ['other'])
+assert.deepEqual(records.map(j=>j.id), ['c','b','a','other'])
+assert.equal(groupHistory([]).size, 0)
+console.log('Score history: chronological grouping, stable ties, zero/full scores and missing/failed results passed.')

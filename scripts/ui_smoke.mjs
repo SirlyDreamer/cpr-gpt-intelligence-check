@@ -2,7 +2,10 @@
 import { chromium } from '../.cache/browser/node_modules/playwright/index.mjs'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { resolve, extname } from 'node:path'
+import { resolve, extname, relative, isAbsolute } from 'node:path'
+import { checkScoreHistory } from './score_history_ui.mjs'
+import { checkSubscriptions } from './subscription_ui.mjs'
+import { checkPausedAccounts } from './paused_accounts_ui.mjs'
 import { createTheme, createThemeVars } from '../frontend/node_modules/@codex-proxy/ui/dist/theme/index.js'
 const root=resolve(import.meta.dirname,'..')
 // UI_DIST / UI_SHOTS let parallel builds run side by side without sharing frontend/dist.
@@ -30,7 +33,7 @@ try {
       }
       else if(input.path==='api/progress'){const revision='ui:'+f.revision,changed=new URLSearchParams(input.query).get('since')!==revision;result={revision,changed,jobs:changed?b.jobs:null,nextDue:b.nextDue,scheduleError:null,errorTrigger:b.errorTrigger}}
       else if(input.path==='api/jobs')result={jobs:b.jobs,banks:b.banks,nextDue:b.nextDue,scheduleError:null,errorTrigger:b.errorTrigger}
-      else if(input.path==='api/report')result=f.report
+      else if(input.path==='api/report')result=f.reports?.[new URLSearchParams(input.query).get('id')] || f.report
       else if(input.path==='api/models')result={models:['gpt-6.1-sol','gpt-5.6-luna']}
       else if(input.path==='api/config'){const data=JSON.parse(input.body);b.config=data.config;b.configRevision++;result={config:data.config,revision:b.configRevision}}
       else if(input.path==='api/config/preview')result={config:JSON.parse(input.body).config}
@@ -47,7 +50,7 @@ try {
     if(new URL(route.request().url()).pathname==='/host.html') {
       await route.fulfill({contentType:'text/html',body:'<iframe src="/" sandbox="allow-scripts" style="width:100%;height:100vh;border:0"></iframe>'});return
     }
-    try {const url=new URL(route.request().url()); const file=resolve(dist,url.pathname==='/'?'index.html':'.'+url.pathname);assert(file.startsWith(dist+'/'));const body=await readFile(file);await route.fulfill({body,contentType:({'.html':'text/html','.js':'text/javascript','.css':'text/css'})[extname(file)] || 'application/octet-stream'})}catch{await route.fulfill({status:404,body:''})}
+    try {const url=new URL(route.request().url()); const file=resolve(dist,url.pathname==='/'?'index.html':'.'+url.pathname);const path=relative(dist,file);assert(path && !path.startsWith('..') && !isAbsolute(path));const body=await readFile(file);await route.fulfill({body,contentType:({'.html':'text/html','.js':'text/javascript','.css':'text/css'})[extname(file)] || 'application/octet-stream'})}catch{await route.fulfill({status:404,body:''})}
   })
   await page.goto('http://plugin.test/')
   await page.getByRole('textbox',{name:'搜索账户',exact:true}).waitFor()
@@ -62,6 +65,9 @@ try {
   assert.match(await testedRow.locator('.cand-inline').innerText(),/gpt-5\.6-terra\s+98\.9%/)
   assert.match(await testedRow.locator('.cell-time').getAttribute('title'),/\d{4}\/\d{1,2}\/\d{1,2} \d{2}:\d{2}:\d{2}/)
   assert.equal(await testedRow.locator('.detection-source').innerText(),'手动')
+  await checkScoreHistory(page, shots)
+  await checkSubscriptions(page, shots)
+  await checkPausedAccounts(page, shots)
   // Request-log trigger status follows bootstrap and every progress poll.
   assert.match((await page.locator('.trigger-tile').innerText()).replace(/\s+/g,' '),/日志触发 未开启/)
   await page.evaluate(()=>{
@@ -115,7 +121,7 @@ try {
   await chooseResult('未降智')
   await accountMatches(2)
   assert.deepEqual((await page.locator('tbody .identity b').allTextContents()).sort(),['account-12@example.com','user@example.com'])
-  for(const [label,option] of [['订阅类型筛选','free'],['账户状态筛选','正常'],['账户分组筛选','默认组']]) {
+  for(const [label,option] of [['订阅类型筛选','Free'],['账户状态筛选','正常'],['账户分组筛选','默认组']]) {
     await page.getByLabel(label,{exact:true}).click()
     await page.getByRole('option',{name:option,exact:true}).click()
     await page.getByRole('listbox').waitFor({state:'hidden'})
@@ -222,15 +228,15 @@ try {
   await page.screenshot({path:resolve(shots,'accounts.png'),fullPage:true})
   // Exercise a real dropdown, not only the text search.
   await page.getByLabel('订阅类型筛选',{exact:true}).click()
-  await page.getByRole('option',{name:'pro',exact:true}).click()
+  await page.getByRole('option',{name:'Pro',exact:true}).click()
   await page.getByRole('listbox').waitFor({state:'hidden'})
   await page.getByText('匹配 11 个',{exact:false}).waitFor()
   await page.getByRole('button',{name:'参数配置',exact:true}).click()
   await page.getByRole('button',{name:'保存全部参数',exact:true}).waitFor()
   // Scheduled subscription filtering is multi-select and keeps both chosen plans.
   await page.getByLabel('定时订阅筛选',{exact:true}).click()
-  await page.getByRole('option',{name:'plus',exact:true}).click()
-  await page.getByRole('option',{name:'pro',exact:true}).click()
+  await page.getByRole('option',{name:'Plus',exact:true}).click()
+  await page.getByRole('option',{name:'Pro',exact:true}).click()
   await page.keyboard.press('Escape')
   await page.getByRole('listbox').waitFor({state:'hidden'})
   for(const [label,value] of [['低置信度复测阈值（%）','20'],['降智判定阈值（%）','90'],['连续确认轮数','1'],['低置信度额外复测次数','1'],['失败后重试（次）','4'],['复测与失败重试间隔（秒）','10']]) {
@@ -282,6 +288,7 @@ try {
   const backup=JSON.parse(await readFile(await download.path(),'utf8'))
   assert.equal(backup.config.requestModel,'custom-request-model')
   assert.equal(backup.format,'modeltrace-health-config')
+  assert.equal(backup.pluginId,'sirly.modeltrace-health')
   assert.equal(backup.config.failureRetries,0)
   assert.equal(backup.config.requestRejectedAction,'disable')
   const saveCalls=await page.evaluate(()=>window.__calls.filter(c=>c.path==='api/config').length)
@@ -291,6 +298,11 @@ try {
   assert.equal(await page.getByRole('textbox',{name:'请求模型',exact:true}).inputValue(),'restored-model')
   assert.equal(await page.evaluate(()=>window.__fixture.bootstrap.config.requestModel),'custom-request-model')
   assert.equal(await page.evaluate(()=>window.__calls.filter(c=>c.path==='api/config').length),saveCalls)
+  // Backups made before the publisher rename still import into the new plugin.
+  const legacyBackup={...backup,pluginId:'personal.modeltrace-health',config:{...backup.config,requestModel:'legacy-restored-model'}}
+  await page.getByLabel('配置文件',{exact:true}).setInputFiles({name:'legacy-backup.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify(legacyBackup))})
+  await page.waitForFunction(()=>document.querySelector('input[aria-label="请求模型"]')?.value==='legacy-restored-model')
+  await page.getByRole('textbox',{name:'请求模型',exact:true}).fill('restored-model')
   await page.getByRole('button',{name:'使用默认规则',exact:true}).click()
   assert.equal(await page.getByRole('spinbutton',{name:'连续确认轮数',exact:true}).inputValue(),'1')
   assert.equal(await failureRetries.inputValue(),'4')

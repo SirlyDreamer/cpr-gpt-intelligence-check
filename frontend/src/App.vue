@@ -9,7 +9,11 @@ import { ZTable, type TableColumn } from '@codex-proxy/ui/table'
 import { ZPagination } from '@codex-proxy/ui/pagination'
 import { ZDialog } from '@codex-proxy/ui/dialog'
 import Settings from './components/Settings.vue'
-import { api, active, date, percent, status, statusLabels, verdict } from './api'
+import ScoreHistory from './components/ScoreHistory.vue'
+import AccountPlanBadge from './components/AccountPlanBadge.vue'
+import { isGptAccount, planOptions, planValue } from './subscription'
+import { groupHistory, scoreText, SCORE_HELP } from './score-history'
+import { api, active, date, percent, status, statusLabels, verdict, schedulingPaused } from './api'
 import { createRequestId } from './request-id'
 import type { Account, Banks, Config, ErrorTrigger, Group, Job, Report } from './types'
 
@@ -24,6 +28,8 @@ const keys = ref<{ id:string; name:string }[]>([]), revision = ref(0), settingsK
 const errorTrigger = ref<ErrorTrigger>()
 const search = ref(''), plan = ref(''), state = ref(''), group = ref(''), resultFilter = ref(''), page = ref(1), pageSize = ref(100), selected = ref<string[]>([])
 const queueOnly = ref(false)
+const provider = ref('openai')
+const providerOptions = [{ value:'openai', label:'GPT 系列' }, { value:'', label:'全部提供方' }]
 const resultOptions = [{value:'',label:'全部检测结果'},{value:'degraded',label:'降智'},{value:'no_match',label:'未降智'},{value:'other',label:'其他'}]
 const resultCategory = (job?: Job) => job?.status === 'completed' && ['degraded','no_match'].includes(job.verdict) ? job.verdict : 'other'
 const historySearch = ref(''), historyVerdict = ref(''), historyPage = ref(1), historySize = ref(20), historySelected = ref<string[]>([])
@@ -33,18 +39,21 @@ const deleteIds = ref<string[]>([]), deleteOpen = ref(false)
 let timer: ReturnType<typeof setTimeout> | undefined, clockTimer: ReturnType<typeof setInterval> | undefined, polling = false, disposed = false, failures = 0, progressRevision: string | undefined
 const clock = ref(Date.now())
 const requestIds = new Map<string,string>()
-const plans = computed(() => [{ value:'',label:'全部订阅' }, ...Array.from(new Set(accounts.value.map(a => a.planType || 'unknown'))).sort().map(p => ({ value:p,label:p }))])
+let accountsRefreshedAt = 0
+const providerAccounts = computed(() => accounts.value.filter(a => !provider.value || isGptAccount(a)))
+const plans = computed(() => [{ value:'',label:'全部订阅' }, ...planOptions(providerAccounts.value)])
 const groups = computed(() => [{ value:'',label:'全部分组' }, {value:'__ungrouped__',label:'未分组'}, ...Array.from(new Map(accounts.value.flatMap(a => a.groups).map(g => [g.id,g])).values()).map(g => ({value:g.id,label:g.name}))])
-const statuses = computed(() => [{value:'',label:'全部账户状态'},{value:'disabled',label:'已停用'},...Array.from(new Set(accounts.value.map(a => a.status))).map(s => ({ value:s,label:statusLabels[s] || s }))])
-const accountTone = (a: Account): Tone => !a.enabled ? 'neutral' : ({ normal:'success', error:'danger', quota_paused:'warning', quota_exhausted:'warning', rate_limited:'warning' } as Record<string,Tone>)[a.status] || 'info'
+const statuses = computed(() => [{value:'',label:'全部账户状态'},{value:'disabled',label:'已停用'},...Array.from(new Set(accounts.value.map(a => a.status))).filter(s=>s!=='disabled').map(s => ({ value:s,label:statusLabels[s] || s }))])
+const accountTone = (a: Account): Tone => !a.enabled ? 'neutral' : ({ normal:'success', disabled:'neutral', error:'danger', quota_paused:'warning', quota_exhausted:'warning', rate_limited:'warning' } as Record<string,Tone>)[a.status] || 'info'
 const latest = computed(() => { const result = new Map<string, Job>(); for (const job of jobs.value) if (!result.has(job.accountId)) result.set(job.accountId, job); return result })
 const jobOf = (a: Account) => latest.value.get(a.id)
+const accountHistory = computed(() => groupHistory(jobs.value))
 const manualActive = (a: Account) => jobs.value.some(j => j.accountId === a.id && j.source === 'manual' && active(j))
-const canDetect = (a: Account) => a.enabled && a.supported && !manualActive(a)
-const filtered = computed(() => accounts.value.filter(a => {
+const canDetect = (a: Account) => !schedulingPaused(a) && a.supported && !manualActive(a)
+const filtered = computed(() => providerAccounts.value.filter(a => {
   const j = jobOf(a)
-  return (!plan.value || (a.planType || 'unknown') === plan.value)
-    && (!state.value || (state.value === 'disabled' ? !a.enabled : a.enabled && a.status === state.value))
+  return (!plan.value || planValue(a) === plan.value)
+    && (!state.value || (state.value === 'disabled' ? !a.enabled || a.status==='disabled' : a.enabled && a.status === state.value))
     && (!group.value || (group.value === '__ungrouped__' ? !a.groups.length : a.groups.some(g => g.id === group.value)))
     && (!search.value.trim() || `${a.name} ${a.email || ''} ${a.id}`.toLowerCase().includes(search.value.trim().toLowerCase()))
     && (!queueOnly.value || jobs.value.some(j => j.accountId === a.id && active(j)))
@@ -60,8 +69,8 @@ const scheduledJobs = computed(() => jobs.value.filter(j => j.source === 'schedu
 const triggeredJobs = computed(() => jobs.value.filter(j => j.source === 'error_code' && active(j)).length)
 const runningJobs = computed(() => jobs.value.filter(j => j.status === 'running').length)
 const queueBreakdown = computed(() => [['手动', manualJobs.value], ['定时', scheduledJobs.value], ['日志触发', triggeredJobs.value]].filter(([, n]) => n).map(([label, n]) => `${label} ${n}`).join(' · '))
-const detectable = computed(() => accounts.value.filter(a => a.enabled && a.supported).length)
-const disabledCount = computed(() => accounts.value.filter(a => !a.enabled).length)
+const detectable = computed(() => accounts.value.filter(a => !schedulingPaused(a) && a.supported).length)
+const disabledCount = computed(() => accounts.value.filter(a => !a.enabled || a.status==='disabled').length)
 const degradedCount = computed(() => accounts.value.filter(a => a.supported && resultCategory(jobOf(a)) === 'degraded').length)
 const noMatchCount = computed(() => accounts.value.filter(a => a.supported && resultCategory(jobOf(a)) === 'no_match').length)
 const untestedCount = computed(() => accounts.value.filter(a => a.supported && !jobOf(a)).length)
@@ -122,14 +131,15 @@ const selectedHistory = computed(() => jobs.value.filter(j => historySelected.va
 const allHistory = computed(() => historyCandidates.value.length > 0 && historyCandidates.value.every(j => historySelected.value.includes(j.id)))
 const visibleHistory = computed(() => history.value.slice((historyPage.value-1)*historySize.value,historyPage.value*historySize.value))
 const currentRound = computed(() => report.value?.rounds[roundIndex.value])
-watch([search,plan,state,group,resultFilter,queueOnly,pageSize], () => { page.value=1 })
+watch([search,provider,plan,state,group,resultFilter,queueOnly,pageSize], () => { page.value=1 })
+watch(plans, options => { if (!options.some(option => option.value === plan.value)) plan.value='' })
 watch([historySearch,historyVerdict,historySize], () => { historyPage.value=1 })
 watch(filtered, a => { page.value=Math.min(page.value,Math.max(1,Math.ceil(a.length/pageSize.value))) })
 watch(history, a => { historyPage.value=Math.min(historyPage.value,Math.max(1,Math.ceil(a.length/historySize.value))) })
 watch(() => report.value?.id, () => { showAllModels.value=false })
 
-const columns: TableColumn<Account>[] = [{key:'select',label:'',kind:'selection',width:48},{key:'identity',label:'账户',kind:'identity',minWidth:250},{key:'plan',label:'订阅',kind:'custom',width:90},{key:'groups',label:'分组',kind:'custom',minWidth:140},{key:'status',label:'账户状态',kind:'custom',width:108},{key:'result',label:'检测结果',kind:'custom',minWidth:280},{key:'time',label:'检测时间',kind:'custom',width:150},{key:'actions',label:'操作',kind:'actions',width:132}]
-const historyColumns: TableColumn<Job>[] = [{key:'select',label:'',kind:'selection',width:48},{key:'account',label:'账户',kind:'identity',minWidth:230},{key:'result',label:'结论',kind:'custom',minWidth:240},{key:'model',label:'最高候选',kind:'custom',minWidth:200},{key:'createdAt',label:'检测时间',kind:'custom',width:150},{key:'actions',label:'操作',kind:'actions',width:132}]
+const columns: TableColumn<Account>[] = [{key:'select',label:'',kind:'selection',width:48},{key:'identity',label:'账户',kind:'identity',minWidth:250},{key:'plan',label:'订阅',kind:'custom',width:90},{key:'groups',label:'分组',kind:'custom',minWidth:140},{key:'status',label:'账户状态',kind:'custom',width:108},{key:'scoreHistory',label:'历史记录',kind:'custom',minWidth:280},{key:'result',label:'最新检测结果',kind:'custom',minWidth:280},{key:'time',label:'检测时间',kind:'custom',width:150},{key:'actions',label:'操作',kind:'actions',width:132}]
+const historyColumns: TableColumn<Job>[] = [{key:'select',label:'',kind:'selection',width:48},{key:'account',label:'账户',kind:'identity',minWidth:230},{key:'result',label:'结论',kind:'custom',minWidth:240},{key:'qualityScore',label:'质量分数',kind:'custom',width:120},{key:'model',label:'最高候选',kind:'custom',minWidth:200},{key:'createdAt',label:'检测时间',kind:'custom',width:150},{key:'actions',label:'操作',kind:'actions',width:132}]
 
 function selectOne(id:string,checked:boolean) { selected.value=checked ? Array.from(new Set([...selected.value,id])) : selected.value.filter(x => x !== id) }
 function selectPage(checked:boolean) { const ids=pageCandidates.value.map(a => a.id); selected.value=checked ? Array.from(new Set([...selected.value,...ids])) : selected.value.filter(id => !ids.includes(id)) }
@@ -190,7 +200,10 @@ const keyName = computed(() => keys.value.find(k => k.id === config.value?.keyId
 async function refreshProgress() {
   const r=await api.progress(progressRevision)
   if (disposed) return
-  progressRevision=r.revision; nextDue.value=r.nextDue; scheduleError.value=r.scheduleError; errorTrigger.value=r.errorTrigger ?? errorTrigger.value
+  nextDue.value=r.nextDue; scheduleError.value=r.scheduleError; errorTrigger.value=r.errorTrigger ?? errorTrigger.value
+  const previousStatuses=new Map(jobs.value.map(j=>[j.id,j.status]))
+  if (Date.now()-accountsRefreshedAt>=30000 || r.jobs?.some(j=>j.status!==previousStatuses.get(j.id) && ['paused','failed'].includes(j.status))) await loadAccounts()
+  progressRevision=r.revision
   if (!r.changed || !r.jobs) return
   const previousActions=new Map(jobs.value.map(j=>[j.id,`${j.disableState}:${j.groupState}`]))
   jobs.value=r.jobs
@@ -223,7 +236,7 @@ async function poll() {
 }
 function visibilityChanged() { if (document.hidden) {if(timer) clearTimeout(timer)} else {clock.value=Date.now(); schedulePoll(0)} }
 
-async function loadAccounts() { accounts.value=(await api.accounts()).accounts }
+async function loadAccounts() { accounts.value=(await api.accounts()).accounts; accountsRefreshedAt=Date.now() }
 async function action(fn: () => Promise<void>) { if(busy.value) return; busy.value=true; error.value=''; notice.value=''; try { await fn() } catch(e) { error.value=(e as Error).message } finally { busy.value=false; schedulePoll(0) } }
 async function load() { loading.value=true; try { const [b,a]=await Promise.all([api.bootstrap(),api.accounts()]); config.value=b.config; if(!b.configRevision) config.value.schedule.timezone=Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; revision.value=b.configRevision; banks.value=b.banks; keys.value=b.keys; allGroups.value=b.groups; jobs.value=b.jobs; accounts.value=a.accounts; nextDue.value=b.nextDue; scheduleError.value=b.scheduleError; errorTrigger.value=b.errorTrigger; settingsKey.value++ } catch(e) { error.value=(e as Error).message } finally { loading.value=false } }
 function openSubmit(ids:string[]) { confirmIds.value=ids; confirmOpen.value=true }
@@ -296,6 +309,7 @@ onUnmounted(() => { disposed=true; if(timer) clearTimeout(timer); if(clockTimer)
         <div class="list-toolbar">
           <div class="list-filters">
             <ZInput v-model="search" class="list-search" placeholder="搜索名称、邮箱或账户ID" clearable aria-label="搜索账户"><template #prefix><Search :size="15" /></template></ZInput>
+            <ZSelect v-model="provider" class="list-filter" :options="providerOptions" aria-label="提供方筛选" />
             <ZSelect v-model="plan" class="list-filter" :options="plans" aria-label="订阅类型筛选" />
             <ZSelect v-model="state" class="list-filter" :options="statuses" aria-label="账户状态筛选" />
             <ZSelect v-model="group" class="list-filter" :options="groups" aria-label="账户分组筛选" />
@@ -320,14 +334,27 @@ onUnmounted(() => { disposed=true; if(timer) clearTimeout(timer); if(clockTimer)
           <ZButton v-if="selected.length" size="small" variant="text" @click="selected=[]">清空选择</ZButton>
           <ZButton v-if="resultFilter || queueOnly" size="small" variant="text" @click="resultFilter='';queueOnly=false">清除结果筛选</ZButton>
         </div>
+        <div class="history-key">
+          <span class="history-key-title">质量历史 · 一格一次</span>
+          <span><i class="history-key-normal" />≥90 分</span><span><i class="history-key-uncertain" />10–&lt;90 分</span><span><i class="history-key-degraded" />&lt;10 分</span><span><i class="history-key-pending" />进行中</span><span><i class="history-key-unknown" />无分数</span>
+          <details class="history-guide"><summary>分数说明</summary><p>{{ SCORE_HELP }} 色块按检测开始时间从左到右排列，颜色表示质量分数区间。悬停或聚焦查看详情，点击打开报告。每个账户展示最近 20 次，实际数量受历史保留设置影响，空格表示暂无记录。分数是候选库内的相对匹配程度；目标模型、别名或指纹库变化会影响可比性，检测结论仍按当次降智规则判定。</p></details>
+        </div>
         <ZTable :columns="columns" :data="visible" :row-key="a=>a.id" :loading="loading" empty-text="没有匹配的账户">
           <template #select="{row}"><ZCheckbox :model-value="selected.includes(row.id)" :disabled="!canDetect(row) || busy" :aria-label="`选择 ${row.email || row.name}`" @change="checked=>selectOne(row.id,checked)" /></template>
           <template #identity="{row}"><div class="identity"><span class="avatar" aria-hidden="true">{{ (row.email || row.name || '?').slice(0,1).toUpperCase() }}</span><div><b :title="row.email || row.name">{{ row.email || row.name }}</b><small :title="row.id">{{ row.name }} · {{ row.provider }}</small></div></div></template>
-          <template #plan="{row}"><span class="pill plan-pill">{{ row.planType || '未知' }}</span></template>
+          <template #plan="{row}"><AccountPlanBadge :account="row" /></template>
           <template #groups="{row}"><div class="tag-list"><span v-for="g in row.groups" :key="g.id" class="pill group-pill">{{ g.name }}</span><span v-if="!row.groups.length" class="cell-empty">未分组</span></div></template>
           <template #status="{row}"><span class="pill dot account-status" :class="`tone-${accountTone(row)}`">{{ status(row) }}</span></template>
+          <template #scoreHistory="{row}">
+            <ScoreHistory v-if="row.supported && accountHistory.get(row.id)?.length" :jobs="accountHistory.get(row.id) || []" :disabled="busy" @report="openReport" />
+            <span v-else class="cell-empty">{{ row.supported ? '暂无记录' : '—' }}</span>
+          </template>
           <template #result="{row}">
             <span v-if="!row.supported" class="cell-empty">暂不支持此提供方</span>
+            <div v-else-if="schedulingPaused(row)" class="cell-stack">
+              <span class="pill dot tone-neutral">已暂停调度</span>
+              <span class="cell-sub">{{ !row.enabled || row.status==='disabled' ? '手动暂停' : '额度暂停' }}</span>
+            </div>
             <div v-else-if="jobOf(row)" class="cell-stack">
               <div class="cell-line">
                 <span class="pill dot" :class="[`tone-${verdictTone(shownVerdict(jobOf(row)!))}`, { pulse: active(jobOf(row)) }]">{{ verdict(shownVerdict(jobOf(row)!)) }}</span>
@@ -398,6 +425,9 @@ onUnmounted(() => { disposed=true; if(timer) clearTimeout(timer); if(clockTimer)
               <span v-if="detailText(row)" class="cell-sub" :class="detailClass(row)" :title="detailText(row)">{{ detailText(row) }}</span>
             </div>
           </template>
+          <template #qualityScore="{row}">
+            <div class="history-score-value tabular" :title="SCORE_HELP"><b>{{ scoreText(row) }}</b></div>
+          </template>
           <template #model="{row}">
             <div v-if="row.prediction" class="cand" :class="{ 'is-degraded': degradedModels.has(row.prediction) }">
               <span class="cand-name mono" :title="row.prediction">{{ row.prediction }}</span>
@@ -467,6 +497,10 @@ onUnmounted(() => { disposed=true; if(timer) clearTimeout(timer); if(clockTimer)
               <span class="rpt-caption">概率</span>
               <strong class="tabular">{{ percent(reportTop.probability) }}</strong>
             </div>
+            <div class="rpt-metric" :title="SCORE_HELP">
+              <span class="rpt-caption">质量分数 / 100</span>
+              <strong class="tabular">{{ scoreText(report) }}</strong>
+            </div>
             <div v-if="detailText(report)" class="rpt-status" :class="detailClass(report)" role="status" aria-live="polite">{{ detailText(report) }}</div>
           </div>
           <dl class="rpt-facts">
@@ -477,6 +511,8 @@ onUnmounted(() => { disposed=true; if(timer) clearTimeout(timer); if(clockTimer)
             <div><dt>{{ report.finishedAt ? '完成时间' : '创建时间' }}</dt><dd class="tabular" :title="date(report.finishedAt || report.createdAt)">{{ when(report.finishedAt || report.createdAt) }}</dd></div>
           </dl>
         </section>
+
+        <p class="help">{{ SCORE_HELP }}</p>
 
         <section v-if="report.trigger" class="rpt-trigger" aria-label="触发来源">
           <div class="rpt-trigger-head"><Zap :size="15" aria-hidden="true" /><b>触发来源</b><span class="pill tone-warning">HTTP {{ report.trigger.code }}</span><span class="rpt-trigger-time" :title="date(report.trigger.observedAt)">{{ when(report.trigger.observedAt) }}观察到</span></div>
